@@ -6,8 +6,15 @@ import {
   parsePermissionVerdict,
   buildRichTextContent,
   formatPermissionPrompt,
+  parseSlashCommand,
+  routeCommand,
+  getAvailableCommands,
+  formatUnknownCommandReply,
+  formatStatusReply,
+  formatHelpChannelReply,
   type LarkApiItem,
   type LarkChat,
+  type StatusInfo,
 } from "./lib";
 
 // ---------------------------------------------------------------------------
@@ -590,5 +597,234 @@ describe("formatPermissionPrompt", () => {
     });
     expect(result).toContain("short");
     expect(result).not.toContain("...");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parseSlashCommand
+// ---------------------------------------------------------------------------
+
+describe("parseSlashCommand", () => {
+  test("parses simple command", () => {
+    const cmd = parseSlashCommand("/clear");
+    expect(cmd).toEqual({ name: "clear", args: "", raw: "/clear" });
+  });
+
+  test("parses command with args", () => {
+    const cmd = parseSlashCommand("/model sonnet");
+    expect(cmd).toEqual({ name: "model", args: "sonnet", raw: "/model sonnet" });
+  });
+
+  test("parses hyphenated command", () => {
+    const cmd = parseSlashCommand("/help-channel");
+    expect(cmd).toEqual({ name: "help-channel", args: "", raw: "/help-channel" });
+  });
+
+  test("normalizes to lowercase", () => {
+    const cmd = parseSlashCommand("/CLEAR");
+    expect(cmd).not.toBeNull();
+    expect(cmd!.name).toBe("clear");
+  });
+
+  test("trims surrounding whitespace", () => {
+    const cmd = parseSlashCommand("  /status  ");
+    expect(cmd).toEqual({ name: "status", args: "", raw: "/status" });
+  });
+
+  test("trims arg whitespace", () => {
+    const cmd = parseSlashCommand("/model   sonnet  ");
+    expect(cmd).not.toBeNull();
+    expect(cmd!.args).toBe("sonnet");
+  });
+
+  test("returns null for non-command text", () => {
+    expect(parseSlashCommand("hello world")).toBeNull();
+  });
+
+  test("returns null for empty string", () => {
+    expect(parseSlashCommand("")).toBeNull();
+  });
+
+  test("returns null for bare slash", () => {
+    expect(parseSlashCommand("/")).toBeNull();
+  });
+
+  test("returns null for slash with only spaces", () => {
+    expect(parseSlashCommand("/ ")).toBeNull();
+  });
+
+  test("returns null for slash with number start", () => {
+    expect(parseSlashCommand("/123")).toBeNull();
+  });
+
+  test("preserves multi-word args", () => {
+    const cmd = parseSlashCommand("/repo internal-affairs feat/new-thing");
+    expect(cmd).not.toBeNull();
+    expect(cmd!.name).toBe("repo");
+    expect(cmd!.args).toBe("internal-affairs feat/new-thing");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// routeCommand
+// ---------------------------------------------------------------------------
+
+describe("routeCommand", () => {
+  test("routes Claude built-in /clear as forward", () => {
+    const route = routeCommand({ name: "clear", args: "", raw: "/clear" });
+    expect(route).toEqual({ kind: "forward" });
+  });
+
+  test("routes Claude built-in /compact as forward", () => {
+    const route = routeCommand({ name: "compact", args: "", raw: "/compact" });
+    expect(route).toEqual({ kind: "forward" });
+  });
+
+  test("routes Claude built-in /model as forward", () => {
+    const route = routeCommand({ name: "model", args: "sonnet", raw: "/model sonnet" });
+    expect(route).toEqual({ kind: "forward" });
+  });
+
+  test("routes /status as mcp", () => {
+    const route = routeCommand({ name: "status", args: "", raw: "/status" });
+    expect(route).toEqual({ kind: "mcp", handler: "status" });
+  });
+
+  test("routes /help-channel as mcp", () => {
+    const route = routeCommand({ name: "help-channel", args: "", raw: "/help-channel" });
+    expect(route).toEqual({ kind: "mcp", handler: "help-channel" });
+  });
+
+  test("routes unknown command as unknown with error text", () => {
+    const route = routeCommand({ name: "nonexistent", args: "", raw: "/nonexistent" });
+    expect(route.kind).toBe("unknown");
+    expect((route as { kind: "unknown"; text: string }).text).toContain("/nonexistent");
+    expect((route as { kind: "unknown"; text: string }).text).toContain("Available commands");
+  });
+
+  test("all Claude builtins route as forward", () => {
+    const builtins = [
+      "clear", "compact", "config", "cost", "doctor", "help", "login",
+      "logout", "memory", "model", "permissions", "review", "terminal-setup", "vim",
+    ];
+    for (const name of builtins) {
+      const route = routeCommand({ name, args: "", raw: `/${name}` });
+      expect(route.kind).toBe("forward");
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getAvailableCommands
+// ---------------------------------------------------------------------------
+
+describe("getAvailableCommands", () => {
+  test("returns non-empty array", () => {
+    const cmds = getAvailableCommands();
+    expect(cmds.length).toBeGreaterThan(0);
+  });
+
+  test("contains both categories", () => {
+    const cmds = getAvailableCommands();
+    const categories = new Set(cmds.map((c) => c.category));
+    expect(categories.has("claude")).toBe(true);
+    expect(categories.has("mcp")).toBe(true);
+  });
+
+  test("every command has name and description", () => {
+    for (const cmd of getAvailableCommands()) {
+      expect(cmd.name.length).toBeGreaterThan(0);
+      expect(cmd.description.length).toBeGreaterThan(0);
+    }
+  });
+
+  test("mcp commands listed first", () => {
+    const cmds = getAvailableCommands();
+    expect(cmds[0].category).toBe("mcp");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// formatUnknownCommandReply
+// ---------------------------------------------------------------------------
+
+describe("formatUnknownCommandReply", () => {
+  test("contains the unknown command name", () => {
+    const result = formatUnknownCommandReply("foo", getAvailableCommands());
+    expect(result).toContain("/foo");
+    expect(result).toContain("Unknown command");
+  });
+
+  test("lists available commands", () => {
+    const result = formatUnknownCommandReply("foo", getAvailableCommands());
+    expect(result).toContain("/status");
+    expect(result).toContain("/clear");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// formatStatusReply
+// ---------------------------------------------------------------------------
+
+describe("formatStatusReply", () => {
+  const info: StatusInfo = {
+    uptimeSeconds: 3661,
+    monitoredChats: ["oc_abc123"],
+    pollIntervalMs: 5000,
+    lastPollTimes: { oc_abc123: "1774324217213" },
+  };
+
+  test("contains uptime in human-readable format", () => {
+    const result = formatStatusReply(info);
+    expect(result).toContain("1h 1m 1s");
+  });
+
+  test("contains poll interval", () => {
+    const result = formatStatusReply(info);
+    expect(result).toContain("5000ms");
+  });
+
+  test("contains monitored chat IDs", () => {
+    const result = formatStatusReply(info);
+    expect(result).toContain("oc_abc123");
+  });
+
+  test("handles short uptime (minutes only)", () => {
+    const result = formatStatusReply({ ...info, uptimeSeconds: 125 });
+    expect(result).toContain("2m 5s");
+  });
+
+  test("handles very short uptime (seconds only)", () => {
+    const result = formatStatusReply({ ...info, uptimeSeconds: 45 });
+    expect(result).toContain("45s");
+  });
+
+  test("handles empty lastPollTimes", () => {
+    const result = formatStatusReply({ ...info, lastPollTimes: {} });
+    expect(result).not.toContain("Last seen:");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// formatHelpChannelReply
+// ---------------------------------------------------------------------------
+
+describe("formatHelpChannelReply", () => {
+  test("groups commands by category", () => {
+    const result = formatHelpChannelReply(getAvailableCommands());
+    expect(result).toContain("Channel commands:");
+    expect(result).toContain("Claude Code commands");
+  });
+
+  test("lists mcp commands with descriptions", () => {
+    const result = formatHelpChannelReply(getAvailableCommands());
+    expect(result).toContain("/status");
+    expect(result).toContain("/help-channel");
+  });
+
+  test("lists Claude built-ins", () => {
+    const result = formatHelpChannelReply(getAvailableCommands());
+    expect(result).toContain("/clear");
+    expect(result).toContain("/compact");
   });
 });

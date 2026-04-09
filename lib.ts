@@ -95,7 +95,7 @@ export function extractTextContent(msg_type: string, contentStr: string): string
 // ---------------------------------------------------------------------------
 
 export function watermarkToStartTime(watermark: string): string {
-  const val = Number(watermark);
+  const val = +watermark;
   if (Number.isNaN(val)) return watermark;
   // create_time is in milliseconds (13 digits); Lark API start_time expects seconds
   return val > 9_999_999_999
@@ -128,10 +128,10 @@ export function processItems(opts: ProcessItemsOptions): ProcessItemsResult {
     if (item.sender?.sender_type === "app") continue;
 
     const createTime = item.create_time;
-    const ct = Number(createTime);
+    const ct = +createTime;
     if (Number.isNaN(ct)) continue;
     // Skip already-seen messages (compare numerically to handle varying digit lengths)
-    if (last && ct <= Number(last)) continue;
+    if (last && ct <= +last) continue;
 
     const senderId =
       item.sender?.sender_id?.open_id ??
@@ -159,14 +159,14 @@ export function processItems(opts: ProcessItemsOptions): ProcessItemsResult {
   let newWatermark: string | undefined;
   if (items.length > 0) {
     newWatermark = items.reduce((max: string, it) => {
-      const t = Number(it.create_time);
-      return !Number.isNaN(t) && t > Number(max) ? it.create_time : max;
+      const t = +it.create_time;
+      return !Number.isNaN(t) && t > +max ? it.create_time : max;
     }, last ?? "0");
   }
 
   // Sort oldest first by create_time (don't assume API returns any particular order)
-  messages.sort((a, b) => Number(a.create_time) - Number(b.create_time));
-  return { messages, newWatermark };
+  const sorted = [...messages].sort((a, b) => +a.create_time - +b.create_time);
+  return { messages: sorted, newWatermark };
 }
 
 // ---------------------------------------------------------------------------
@@ -224,5 +224,131 @@ export function formatPermissionPrompt(params: {
     `Tool: ${params.tool_name}`,
     `Description: ${params.description}`,
     `Preview: ${preview}`,
+  ].join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Slash command types
+// ---------------------------------------------------------------------------
+
+export interface SlashCommand {
+  readonly name: string;
+  readonly args: string;
+  readonly raw: string;
+}
+
+export type CommandRoute =
+  | { readonly kind: "forward" }
+  | { readonly kind: "mcp"; readonly handler: string }
+  | { readonly kind: "unknown"; readonly text: string };
+
+export interface CommandInfo {
+  readonly name: string;
+  readonly description: string;
+  readonly category: "claude" | "mcp";
+}
+
+export interface StatusInfo {
+  readonly uptimeSeconds: number;
+  readonly monitoredChats: readonly string[];
+  readonly pollIntervalMs: number;
+  readonly lastPollTimes: Readonly<Record<string, string>>;
+}
+
+// ---------------------------------------------------------------------------
+// Slash command parsing
+// ---------------------------------------------------------------------------
+
+const SLASH_CMD_RE = /^\/([a-z][a-z0-9-]*)(?:\s+(.*))?$/i;
+
+export function parseSlashCommand(text: string): SlashCommand | null {
+  const trimmed = text.trim();
+  const m = SLASH_CMD_RE.exec(trimmed);
+  if (!m) return null;
+  return { name: m[1].toLowerCase(), args: (m[2] ?? "").trim(), raw: trimmed };
+}
+
+// ---------------------------------------------------------------------------
+// Command registry and routing
+// ---------------------------------------------------------------------------
+
+const CLAUDE_BUILTINS = new Set([
+  "clear", "compact", "config", "cost", "doctor", "help", "login",
+  "logout", "memory", "model", "permissions", "review", "terminal-setup", "vim",
+]);
+
+const MCP_COMMAND_REGISTRY: readonly CommandInfo[] = [
+  { name: "status", description: "Show channel uptime, monitored chats, and poll info", category: "mcp" },
+  { name: "help-channel", description: "List all available slash commands", category: "mcp" },
+];
+
+const MCP_COMMANDS = new Set(MCP_COMMAND_REGISTRY.map((c) => c.name));
+
+export function getAvailableCommands(): readonly CommandInfo[] {
+  const claude: CommandInfo[] = [...CLAUDE_BUILTINS].sort().map((name) => ({
+    name,
+    description: `Claude Code built-in /${name}`,
+    category: "claude" as const,
+  }));
+  return [...MCP_COMMAND_REGISTRY, ...claude];
+}
+
+export function routeCommand(cmd: SlashCommand): CommandRoute {
+  if (MCP_COMMANDS.has(cmd.name)) {
+    return { kind: "mcp", handler: cmd.name };
+  }
+  if (CLAUDE_BUILTINS.has(cmd.name)) {
+    return { kind: "forward" };
+  }
+  return {
+    kind: "unknown",
+    text: formatUnknownCommandReply(cmd.name, getAvailableCommands()),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Slash command formatters
+// ---------------------------------------------------------------------------
+
+export function formatUnknownCommandReply(
+  commandName: string,
+  available: readonly CommandInfo[],
+): string {
+  const list = available.map((c) => `  /${c.name} — ${c.description}`).join("\n");
+  return `Unknown command: /${commandName}\n\nAvailable commands:\n${list}`;
+}
+
+export function formatStatusReply(info: StatusInfo): string {
+  const uptime = Math.floor(info.uptimeSeconds);
+  const h = Math.floor(uptime / 3600);
+  const m = Math.floor((uptime % 3600) / 60);
+  const s = uptime % 60;
+  const uptimeStr = h > 0 ? `${h}h ${m}m ${s}s` : m > 0 ? `${m}m ${s}s` : `${s}s`;
+  const chats = info.monitoredChats.join(", ");
+  const polls = Object.entries(info.lastPollTimes)
+    .map(([id, ts]) => `  ${id}: last seen ${ts}`)
+    .join("\n");
+  return [
+    `Channel Status`,
+    `Uptime: ${uptimeStr}`,
+    `Poll interval: ${info.pollIntervalMs}ms`,
+    `Monitored chats: ${chats}`,
+    polls ? `Last seen:\n${polls}` : "",
+  ].filter(Boolean).join("\n");
+}
+
+export function formatHelpChannelReply(commands: readonly CommandInfo[]): string {
+  const mcpCmds = commands.filter((c) => c.category === "mcp");
+  const claudeCmds = commands.filter((c) => c.category === "claude");
+  const mcpList = mcpCmds.map((c) => `  /${c.name} — ${c.description}`).join("\n");
+  const claudeList = claudeCmds.map((c) => `  /${c.name}`).join("\n");
+  return [
+    `Lark Channel Commands`,
+    ``,
+    `Channel commands:`,
+    mcpList,
+    ``,
+    `Claude Code commands (forwarded):`,
+    claudeList,
   ].join("\n");
 }

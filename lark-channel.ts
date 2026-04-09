@@ -18,11 +18,17 @@ import { z } from "zod";
 import {
   type LarkChat,
   type LarkMessage,
+  type StatusInfo,
   watermarkToStartTime,
   processItems,
   parsePermissionVerdict,
+  parseSlashCommand,
+  routeCommand,
   buildRichTextContent,
   formatPermissionPrompt,
+  formatStatusReply,
+  formatHelpChannelReply,
+  getAvailableCommands,
 } from "./lib";
 
 // ---------------------------------------------------------------------------
@@ -37,13 +43,12 @@ if (!APP_ID || !APP_SECRET) {
 const BASE_URL =
   process.env.LARK_BASE_URL ?? "https://open.larksuite.com/open-apis";
 
-// Chats to monitor — comma-separated chat_ids via env, defaults to DM chat
-const MONITOR_CHATS = (
-  process.env.LARK_CHAT_IDS ?? "oc_4641d16a6e5c12946e4571ffab89365d"
-)
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
+// Chats to monitor — comma-separated chat_ids via env (required)
+const rawChatIds = process.env.LARK_CHAT_IDS;
+if (!rawChatIds) {
+  throw new Error("[lark-channel] LARK_CHAT_IDS env var is required");
+}
+const MONITOR_CHATS = rawChatIds.split(",").map((s) => s.trim()).filter(Boolean);
 
 // Allowed sender open_ids — empty means allow all senders in monitored chats
 const ALLOWED_SENDERS = process.env.LARK_ALLOWED_SENDERS
@@ -380,6 +385,46 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
   }
 });
 
+// --- Slash command handlers --------------------------------------------------
+
+const startedAt = Date.now();
+
+function gatherStatusInfo(): StatusInfo {
+  return {
+    uptimeSeconds: (Date.now() - startedAt) / 1000,
+    monitoredChats: MONITOR_CHATS,
+    pollIntervalMs: POLL_INTERVAL_MS,
+    lastPollTimes: Object.fromEntries(lastSeen),
+  };
+}
+
+function handleMcpCommand(handler: string): string {
+  switch (handler) {
+    case "status":
+      return formatStatusReply(gatherStatusInfo());
+    case "help-channel":
+      return formatHelpChannelReply(getAvailableCommands());
+    default:
+      throw new Error(`[lark-channel] unhandled mcp handler: ${handler}`);
+  }
+}
+
+async function replyToChat(chatId: string, text: string): Promise<void> {
+  try {
+    await larkPost(
+      "/im/v1/messages",
+      {
+        receive_id: chatId,
+        msg_type: "text",
+        content: JSON.stringify({ text }),
+      },
+      { receive_id_type: "chat_id" },
+    );
+  } catch (e) {
+    console.error(`[lark-channel] reply to ${chatId} failed:`, e);
+  }
+}
+
 // --- Connect and start polling ----------------------------------------------
 
 await mcp.connect(new StdioServerTransport());
@@ -417,6 +462,27 @@ async function startPolling() {
               params: verdict,
             });
             continue;
+          }
+
+          // Check for slash command
+          const command = parseSlashCommand(msg.body);
+          if (command) {
+            const route = routeCommand(command);
+            switch (route.kind) {
+              case "mcp": {
+                const reply = handleMcpCommand(route.handler);
+                await replyToChat(msg.chat_id, reply);
+                break;
+              }
+              case "unknown": {
+                await replyToChat(msg.chat_id, route.text);
+                break;
+              }
+              case "forward":
+                // Fall through to channel event forwarding below
+                break;
+            }
+            if (route.kind !== "forward") continue;
           }
 
           // Forward as channel event
