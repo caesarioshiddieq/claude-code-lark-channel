@@ -352,3 +352,51 @@ export function formatHelpChannelReply(commands: readonly CommandInfo[]): string
     claudeList,
   ].join("\n");
 }
+
+// ---------------------------------------------------------------------------
+// Supervisor types and routing
+// ---------------------------------------------------------------------------
+
+export type SupervisorRoute =
+  | { readonly kind: "lifecycle"; readonly command: "start" | "stop" | "restart" }
+  | { readonly kind: "query"; readonly command: "status" | "help-channel" }
+  | { readonly kind: "passthrough" }
+  | { readonly kind: "unknown"; readonly text: string };
+
+export interface SessionInfo {
+  readonly running: boolean;
+  readonly repo: string | null;
+  readonly uptimeSeconds: number;
+  readonly monitoredChats: readonly string[];
+}
+
+const LIFECYCLE_COMMANDS = new Set(["start", "stop", "restart"]);
+const QUERY_COMMANDS = new Set(["status", "help-channel"]);
+
+export function routeSupervisorCommand(cmd: SlashCommand): SupervisorRoute {
+  if (LIFECYCLE_COMMANDS.has(cmd.name)) {
+    return { kind: "lifecycle", command: cmd.name as "start" | "stop" | "restart" };
+  }
+  if (QUERY_COMMANDS.has(cmd.name)) {
+    return { kind: "query", command: cmd.name as "status" | "help-channel" };
+  }
+  if (CLAUDE_BUILTINS.has(cmd.name)) {
+    return { kind: "passthrough" };
+  }
+  return { kind: "unknown", text: formatUnknownSupervisorReply(cmd.name) };
+}
+
+function formatUnknownSupervisorReply(commandName: string): string {
+  return [
+    `Unknown command: /${commandName}`,
+    ``,
+    `Lifecycle commands:`,
+    `  /start [repo] — Start a Claude Code session`,
+    `  /stop — Stop the active session`,
+    `  /restart [repo] — Restart the session`,
+    ``,
+    `Query commands:`,
+    `  /status — Show session status`,
+    `  /help-channel — List all commands`,
+  ].join("\n");
+}

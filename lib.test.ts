@@ -12,9 +12,11 @@ import {
   formatUnknownCommandReply,
   formatStatusReply,
   formatHelpChannelReply,
+  routeSupervisorCommand,
   type LarkApiItem,
   type LarkChat,
   type StatusInfo,
+  type SupervisorRoute,
 } from "./lib";
 
 // ---------------------------------------------------------------------------
@@ -826,5 +828,51 @@ describe("formatHelpChannelReply", () => {
     const result = formatHelpChannelReply(getAvailableCommands());
     expect(result).toContain("/clear");
     expect(result).toContain("/compact");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// routeSupervisorCommand
+// ---------------------------------------------------------------------------
+
+describe("routeSupervisorCommand", () => {
+  test("routes /start as lifecycle", () => {
+    const route = routeSupervisorCommand({ name: "start", args: "internal-affairs", raw: "/start internal-affairs" });
+    expect(route).toEqual({ kind: "lifecycle", command: "start" });
+  });
+
+  test("routes /stop as lifecycle", () => {
+    const route = routeSupervisorCommand({ name: "stop", args: "", raw: "/stop" });
+    expect(route).toEqual({ kind: "lifecycle", command: "stop" });
+  });
+
+  test("routes /restart as lifecycle", () => {
+    const route = routeSupervisorCommand({ name: "restart", args: "", raw: "/restart" });
+    expect(route).toEqual({ kind: "lifecycle", command: "restart" });
+  });
+
+  test("routes /status as query", () => {
+    const route = routeSupervisorCommand({ name: "status", args: "", raw: "/status" });
+    expect(route).toEqual({ kind: "query", command: "status" });
+  });
+
+  test("routes /help-channel as query", () => {
+    const route = routeSupervisorCommand({ name: "help-channel", args: "", raw: "/help-channel" });
+    expect(route).toEqual({ kind: "query", command: "help-channel" });
+  });
+
+  test("routes /clear as passthrough", () => {
+    const route = routeSupervisorCommand({ name: "clear", args: "", raw: "/clear" });
+    expect(route).toEqual({ kind: "passthrough" });
+  });
+
+  test("routes /compact as passthrough", () => {
+    const route = routeSupervisorCommand({ name: "compact", args: "", raw: "/compact" });
+    expect(route).toEqual({ kind: "passthrough" });
+  });
+
+  test("routes unknown command as unknown", () => {
+    const route = routeSupervisorCommand({ name: "foo", args: "", raw: "/foo" });
+    expect(route.kind).toBe("unknown");
   });
 });
