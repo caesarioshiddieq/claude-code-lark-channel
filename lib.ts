@@ -400,3 +400,17 @@ function formatUnknownSupervisorReply(commandName: string): string {
     `  /help-channel — List all commands`,
   ].join("\n");
 }
+
+// ---------------------------------------------------------------------------
+// Repo name validation (shell injection prevention)
+// ---------------------------------------------------------------------------
+
+export function validateRepoName(
+  name: string,
+  available: readonly string[],
+): string | null {
+  const sanitized = name.replace(/[^a-zA-Z0-9_-]/g, "");
+  if (sanitized.length === 0) return null;
+  if (sanitized !== name) return null;
+  return available.includes(sanitized) ? sanitized : null;
+}

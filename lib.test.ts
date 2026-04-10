@@ -13,6 +13,7 @@ import {
   formatStatusReply,
   formatHelpChannelReply,
   routeSupervisorCommand,
+  validateRepoName,
   type LarkApiItem,
   type LarkChat,
   type StatusInfo,
@@ -874,5 +875,49 @@ describe("routeSupervisorCommand", () => {
   test("routes unknown command as unknown", () => {
     const route = routeSupervisorCommand({ name: "foo", args: "", raw: "/foo" });
     expect(route.kind).toBe("unknown");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// validateRepoName
+// ---------------------------------------------------------------------------
+
+describe("validateRepoName", () => {
+  const available = ["internal-affairs", "person-service", "kelola-app"];
+
+  test("returns valid repo name", () => {
+    expect(validateRepoName("internal-affairs", available)).toBe("internal-affairs");
+  });
+
+  test("returns null for unknown repo", () => {
+    expect(validateRepoName("nonexistent", available)).toBeNull();
+  });
+
+  test("strips path separators", () => {
+    expect(validateRepoName("../../../etc/passwd", available)).toBeNull();
+  });
+
+  test("strips tildes", () => {
+    expect(validateRepoName("~root", available)).toBeNull();
+  });
+
+  test("strips dots", () => {
+    expect(validateRepoName("..internal-affairs", available)).toBeNull();
+  });
+
+  test("returns null for empty string", () => {
+    expect(validateRepoName("", available)).toBeNull();
+  });
+
+  test("returns null for only special chars", () => {
+    expect(validateRepoName("../../../", available)).toBeNull();
+  });
+
+  test("allows hyphens and underscores", () => {
+    expect(validateRepoName("person-service", available)).toBe("person-service");
+  });
+
+  test("is case-sensitive", () => {
+    expect(validateRepoName("Internal-Affairs", available)).toBeNull();
   });
 });
