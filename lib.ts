@@ -414,3 +414,53 @@ export function validateRepoName(
   if (sanitized !== name) return null;
   return available.includes(sanitized) ? sanitized : null;
 }
+
+// ---------------------------------------------------------------------------
+// Supervisor formatters
+// ---------------------------------------------------------------------------
+
+export function formatSessionStarted(repo: string): string {
+  return `Session started in ${repo}. Claude Code is loading...`;
+}
+
+export function formatSessionStopped(): string {
+  return `Session stopped.`;
+}
+
+export function formatSessionStatus(info: SessionInfo): string {
+  if (!info.running) {
+    return [
+      `Session Status: Stopped`,
+      `Monitored chats: ${info.monitoredChats.join(", ")}`,
+      `Send /start [repo] to begin.`,
+    ].join("\n");
+  }
+  const uptime = Math.floor(info.uptimeSeconds);
+  const h = Math.floor(uptime / 3600);
+  const m = Math.floor((uptime % 3600) / 60);
+  const s = uptime % 60;
+  const uptimeStr = h > 0 ? `${h}h ${m}m ${s}s` : m > 0 ? `${m}m ${s}s` : `${s}s`;
+  return [
+    `Session Status: Running`,
+    `Repo: ${info.repo}`,
+    `Uptime: ${uptimeStr}`,
+    `Monitored chats: ${info.monitoredChats.join(", ")}`,
+  ].join("\n");
+}
+
+export function formatNotActive(): string {
+  return `Session is not active. Send /start [repo] to begin.`;
+}
+
+export function formatUnauthorized(): string {
+  return `You don't have permission to control sessions.`;
+}
+
+export function formatOperationInProgress(): string {
+  return `A lifecycle operation is in progress. Please wait.`;
+}
+
+export function formatInvalidRepo(name: string, available: readonly string[]): string {
+  const list = available.map((r) => `  ${r}`).join("\n");
+  return `Unknown repo: ${name}\n\nAvailable repos:\n${list}`;
+}

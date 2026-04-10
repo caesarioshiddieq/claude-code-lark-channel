@@ -14,10 +14,18 @@ import {
   formatHelpChannelReply,
   routeSupervisorCommand,
   validateRepoName,
+  formatSessionStarted,
+  formatSessionStopped,
+  formatSessionStatus,
+  formatNotActive,
+  formatUnauthorized,
+  formatOperationInProgress,
+  formatInvalidRepo,
   type LarkApiItem,
   type LarkChat,
   type StatusInfo,
   type SupervisorRoute,
+  type SessionInfo,
 } from "./lib";
 
 // ---------------------------------------------------------------------------
@@ -919,5 +927,78 @@ describe("validateRepoName", () => {
 
   test("is case-sensitive", () => {
     expect(validateRepoName("Internal-Affairs", available)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Supervisor formatters
+// ---------------------------------------------------------------------------
+
+describe("formatSessionStarted", () => {
+  test("contains repo name", () => {
+    expect(formatSessionStarted("internal-affairs")).toContain("internal-affairs");
+  });
+
+  test("indicates session started", () => {
+    expect(formatSessionStarted("person-service")).toContain("started");
+  });
+});
+
+describe("formatSessionStopped", () => {
+  test("indicates session stopped", () => {
+    expect(formatSessionStopped()).toContain("stopped");
+  });
+});
+
+describe("formatSessionStatus", () => {
+  test("shows running state with repo", () => {
+    const info: SessionInfo = {
+      running: true,
+      repo: "internal-affairs",
+      uptimeSeconds: 3661,
+      monitoredChats: ["oc_abc"],
+    };
+    const result = formatSessionStatus(info);
+    expect(result).toContain("Running");
+    expect(result).toContain("internal-affairs");
+    expect(result).toContain("1h 1m 1s");
+  });
+
+  test("shows stopped state", () => {
+    const info: SessionInfo = {
+      running: false,
+      repo: null,
+      uptimeSeconds: 0,
+      monitoredChats: ["oc_abc"],
+    };
+    const result = formatSessionStatus(info);
+    expect(result).toContain("Stopped");
+  });
+});
+
+describe("formatNotActive", () => {
+  test("suggests /start command", () => {
+    expect(formatNotActive()).toContain("/start");
+  });
+});
+
+describe("formatUnauthorized", () => {
+  test("indicates no permission", () => {
+    expect(formatUnauthorized()).toContain("permission");
+  });
+});
+
+describe("formatOperationInProgress", () => {
+  test("indicates busy", () => {
+    expect(formatOperationInProgress()).toContain("progress");
+  });
+});
+
+describe("formatInvalidRepo", () => {
+  test("shows invalid name and available repos", () => {
+    const result = formatInvalidRepo("bad-repo", ["internal-affairs", "person-service"]);
+    expect(result).toContain("bad-repo");
+    expect(result).toContain("internal-affairs");
+    expect(result).toContain("person-service");
   });
 });
