@@ -1,6 +1,7 @@
 package worker_test
 
 import (
+	"context"
 	"os"
 	"testing"
 
@@ -61,5 +62,16 @@ func TestParseClaudeOutput_ErrorCase(t *testing.T) {
 	_, err := worker.ParseClaudeOutput(raw)
 	if err == nil {
 		t.Fatal("expected error for is_error=true")
+	}
+}
+
+func TestSpawnClaude_ContextCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately
+	uuid := "test-session-uuid"
+	// With a cancelled context, exec.CommandContext should fail immediately
+	_, err := worker.SpawnClaude(ctx, uuid, true, "hello")
+	if err == nil {
+		t.Fatal("expected error when context is cancelled")
 	}
 }

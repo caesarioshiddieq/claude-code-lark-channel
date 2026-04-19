@@ -1,6 +1,7 @@
 package lark_test
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -35,7 +36,7 @@ func TestListComments_ReturnsItems(t *testing.T) {
 	defer srv.Close()
 
 	c := lark.NewClient(lark.Config{AppID: "id", AppSecret: "sec", BaseURL: srv.URL})
-	resp, err := c.ListComments("task-abc", "")
+	resp, err := c.ListComments(context.Background(), "task-abc", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +59,7 @@ func TestPostComment_ReturnsCommentID(t *testing.T) {
 	defer srv.Close()
 
 	c := lark.NewClient(lark.Config{AppID: "id", AppSecret: "sec", BaseURL: srv.URL})
-	commentID, err := c.PostComment("task-abc", "reply text", "c1")
+	commentID, err := c.PostComment(context.Background(), "task-abc", "reply text", "c1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,7 +85,7 @@ func TestListTasklistTasks_ReturnsGUIDs(t *testing.T) {
 	defer srv.Close()
 
 	c := lark.NewClient(lark.Config{AppID: "id", AppSecret: "sec", BaseURL: srv.URL})
-	ids, err := c.ListTasklistTasks("tl-abc")
+	ids, err := c.ListTasklistTasks(context.Background(), "tl-abc")
 	if err != nil {
 		t.Fatal(err)
 	}

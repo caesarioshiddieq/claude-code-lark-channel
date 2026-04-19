@@ -2,6 +2,7 @@ package lark
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -57,7 +58,7 @@ func NewClient(cfg Config) *Client {
 	return &Client{cfg: cfg, httpClient: &http.Client{Timeout: 15 * time.Second}}
 }
 
-func (c *Client) ensureToken() (string, error) {
+func (c *Client) ensureToken(ctx context.Context) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.token != "" && time.Now().Before(c.tokenExp) {
@@ -70,10 +71,13 @@ func (c *Client) ensureToken() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("lark auth marshal: %w", err)
 	}
-	resp, err := c.httpClient.Post(
-		c.cfg.BaseURL+"/auth/v3/app_access_token/internal",
-		"application/json", bytes.NewReader(body),
-	)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.cfg.BaseURL+"/auth/v3/app_access_token/internal", bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("lark auth request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("lark auth: %w", err)
 	}
@@ -95,12 +99,12 @@ func (c *Client) ensureToken() (string, error) {
 	return c.token, nil
 }
 
-func (c *Client) doGET(path string, params map[string]string) (*http.Response, error) {
-	tok, err := c.ensureToken()
+func (c *Client) doGET(ctx context.Context, path string, params map[string]string) (*http.Response, error) {
+	tok, err := c.ensureToken(ctx)
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequest(http.MethodGet, c.cfg.BaseURL+path, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.cfg.BaseURL+path, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -113,8 +117,8 @@ func (c *Client) doGET(path string, params map[string]string) (*http.Response, e
 	return c.httpClient.Do(req)
 }
 
-func (c *Client) doPOST(path string, body any) (*http.Response, error) {
-	tok, err := c.ensureToken()
+func (c *Client) doPOST(ctx context.Context, path string, body any) (*http.Response, error) {
+	tok, err := c.ensureToken(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -122,7 +126,7 @@ func (c *Client) doPOST(path string, body any) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequest(http.MethodPost, c.cfg.BaseURL+path, bytes.NewReader(b))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.BaseURL+path, bytes.NewReader(b))
 	if err != nil {
 		return nil, err
 	}
@@ -132,7 +136,7 @@ func (c *Client) doPOST(path string, body any) (*http.Response, error) {
 }
 
 // ListComments fetches one page of comments for taskID. Pass pageToken="" for first page.
-func (c *Client) ListComments(taskID, pageToken string) (ListCommentsResult, error) {
+func (c *Client) ListComments(ctx context.Context, taskID, pageToken string) (ListCommentsResult, error) {
 	// Fix 2: validate taskID before URL interpolation.
 	if err := validateID(taskID, "taskID"); err != nil {
 		return ListCommentsResult{}, err
@@ -141,7 +145,7 @@ func (c *Client) ListComments(taskID, pageToken string) (ListCommentsResult, err
 	if pageToken != "" {
 		params["page_token"] = pageToken
 	}
-	resp, err := c.doGET("/task/v2/tasks/"+taskID+"/comments", params)
+	resp, err := c.doGET(ctx, "/task/v2/tasks/"+taskID+"/comments", params)
 	if err != nil {
 		return ListCommentsResult{}, err
 	}
@@ -171,7 +175,7 @@ func (c *Client) ListComments(taskID, pageToken string) (ListCommentsResult, err
 
 // PostComment posts content as a reply to replyToCommentID on taskID.
 // Pass replyToCommentID="" for a top-level comment. Returns the new comment_id.
-func (c *Client) PostComment(taskID, content, replyToCommentID string) (string, error) {
+func (c *Client) PostComment(ctx context.Context, taskID, content, replyToCommentID string) (string, error) {
 	body := map[string]any{
 		"resource_type": "task",
 		"resource_id":   taskID,
@@ -180,7 +184,7 @@ func (c *Client) PostComment(taskID, content, replyToCommentID string) (string, 
 	if replyToCommentID != "" {
 		body["reply_to_comment_id"] = replyToCommentID
 	}
-	resp, err := c.doPOST("/task/v2/comments", body)
+	resp, err := c.doPOST(ctx, "/task/v2/comments", body)
 	if err != nil {
 		return "", err
 	}
@@ -208,7 +212,7 @@ func (c *Client) PostComment(taskID, content, replyToCommentID string) (string, 
 
 // ListTasklistTasks returns GUIDs of all non-completed tasks in a tasklist.
 // ⚠ Verify "guid" field name against Lark Task v2 API docs before deploying.
-func (c *Client) ListTasklistTasks(tasklistID string) ([]string, error) {
+func (c *Client) ListTasklistTasks(ctx context.Context, tasklistID string) ([]string, error) {
 	// Fix 2: validate tasklistID before URL interpolation.
 	if err := validateID(tasklistID, "tasklistID"); err != nil {
 		return nil, err
@@ -220,7 +224,7 @@ func (c *Client) ListTasklistTasks(tasklistID string) ([]string, error) {
 		if pageToken != "" {
 			params["page_token"] = pageToken
 		}
-		resp, err := c.doGET("/task/v2/tasklists/"+tasklistID+"/tasks", params)
+		resp, err := c.doGET(ctx, "/task/v2/tasklists/"+tasklistID+"/tasks", params)
 		if err != nil {
 			return nil, err
 		}

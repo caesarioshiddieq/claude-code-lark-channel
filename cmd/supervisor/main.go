@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -40,6 +42,8 @@ func loadConfig() config {
 	if s := os.Getenv("POLL_INTERVAL"); s != "" {
 		if d, err := time.ParseDuration(s); err == nil {
 			pollInterval = d
+		} else {
+			log.Printf("invalid POLL_INTERVAL=%q: %v; using default 30s", s, err)
 		}
 	}
 	dbPath := "/var/lib/claude-vm/queue.db"
@@ -54,6 +58,14 @@ func loadConfig() config {
 			}
 		}
 	}
+	maxTurns := 50
+	if s := os.Getenv("MAX_TURNS_PER_SESSION"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n > 0 {
+			maxTurns = n
+		} else {
+			log.Printf("invalid MAX_TURNS_PER_SESSION=%q, using default 50", s)
+		}
+	}
 	return config{
 		AppID:              mustEnv("LARK_APP_ID"),
 		AppSecret:          mustEnv("LARK_APP_SECRET"),
@@ -62,7 +74,7 @@ func loadConfig() config {
 		AllowList:          allowList,
 		DBPath:             dbPath,
 		PollInterval:       pollInterval,
-		MaxTurnsPerSession: 50,
+		MaxTurnsPerSession: maxTurns,
 	}
 }
 
@@ -79,7 +91,7 @@ func isAllowed(creatorID string, allowList []string) bool {
 }
 
 func pollOnce(ctx context.Context, client *lark.Client, db *q.DB, cfg config) {
-	tasks, err := client.ListTasklistTasks(cfg.TasklistID)
+	tasks, err := client.ListTasklistTasks(ctx, cfg.TasklistID)
 	if err != nil {
 		log.Printf("[poller] list tasks: %v", err)
 		return
@@ -88,16 +100,20 @@ func pollOnce(ctx context.Context, client *lark.Client, db *q.DB, cfg config) {
 		if ctx.Err() != nil {
 			return
 		}
-		pollTask(client, db, taskID, cfg.AllowList)
+		pollTask(ctx, client, db, taskID, cfg.AllowList)
 	}
 }
 
-func pollTask(client *lark.Client, db *q.DB, taskID string, allowList []string) {
-	watermark, _, _ := db.GetWatermark(taskID)
+func pollTask(ctx context.Context, client *lark.Client, db *q.DB, taskID string, allowList []string) {
+	watermark, _, err := db.GetWatermark(taskID)
+	if err != nil {
+		log.Printf("[poller] get watermark task=%s: %v", taskID, err)
+		return
+	}
 	pageToken := ""
 	var latestID string
 	for {
-		resp, err := client.ListComments(taskID, pageToken)
+		resp, err := client.ListComments(ctx, taskID, pageToken)
 		if err != nil {
 			log.Printf("[poller] list comments task=%s: %v", taskID, err)
 			break
@@ -131,7 +147,7 @@ func pollTask(client *lark.Client, db *q.DB, taskID string, allowList []string) 
 	}
 }
 
-func processOne(db *q.DB, client *lark.Client, maxTurns int) bool {
+func processOne(ctx context.Context, db *q.DB, client *lark.Client, maxTurns int) bool {
 	row, found, err := db.NextInboxRow()
 	if err != nil {
 		log.Printf("[worker] next inbox: %v", err)
@@ -167,36 +183,56 @@ func processOne(db *q.DB, client *lark.Client, maxTurns int) bool {
 		prompt = "/compact\n\n" + prompt
 	}
 
-	reply, err := worker.SpawnClaude(sessionUUID, isNew, prompt)
+	reply, err := worker.SpawnClaude(ctx, sessionUUID, isNew, prompt)
 	if err != nil {
 		log.Printf("[worker] spawn task=%s comment=%s: %v", row.TaskID, row.CommentID, err)
-		db.MoveToDeadLetter(row.CommentID, row.TaskID, err.Error()) //nolint:errcheck
+		if dlqErr := db.MoveToDeadLetter(row.CommentID, row.TaskID, err.Error()); dlqErr != nil {
+			log.Printf("[worker] dlq move failed task=%s comment=%s: %v; marking processed", row.TaskID, row.CommentID, dlqErr)
+			if mErr := db.MarkInboxProcessed(row.CommentID); mErr != nil {
+				log.Printf("[worker] mark processed fallback failed comment=%s: %v", row.CommentID, mErr)
+			}
+		}
 		return true
 	}
 
 	hash := worker.ContentHash(row.TaskID, reply)
-	if existingID, posted, _ := db.OutboxCheck(hash); posted && existingID != "" {
+	existingID, found, outboxErr := db.OutboxCheck(hash)
+	if outboxErr != nil {
+		log.Printf("[worker] outbox check task=%s: %v", row.TaskID, outboxErr)
+	}
+	if found && existingID != "" {
 		log.Printf("[worker] reply already posted (outbox hit) task=%s", row.TaskID)
 	} else {
 		db.OutboxInsert(hash, row.TaskID, row.CommentID) //nolint:errcheck
-		if newCommentID, err := client.PostComment(row.TaskID, reply, row.CommentID); err != nil {
+		if newCommentID, err := client.PostComment(ctx, row.TaskID, reply, row.CommentID); err != nil {
 			log.Printf("[worker] post comment task=%s: %v", row.TaskID, err)
 		} else {
 			db.OutboxMarkPosted(hash, newCommentID) //nolint:errcheck
 		}
 	}
 
-	db.MarkInboxProcessed(row.CommentID) //nolint:errcheck
-	db.IncrTurnCount(row.TaskID)         //nolint:errcheck
+	if err := db.MarkInboxProcessed(row.CommentID); err != nil {
+		log.Printf("[worker] mark processed comment=%s: %v", row.CommentID, err)
+	}
+	if err := db.IncrTurnCount(row.TaskID); err != nil {
+		log.Printf("[worker] incr turn count task=%s: %v", row.TaskID, err)
+	}
 	return true
 }
 
 func newUUID() string {
-	b, err := os.ReadFile("/proc/sys/kernel/random/uuid")
-	if err != nil {
-		return fmt.Sprintf("session-%d", time.Now().UnixNano())
+	if b, err := os.ReadFile("/proc/sys/kernel/random/uuid"); err == nil {
+		return strings.TrimSpace(string(b))
 	}
-	return strings.TrimSpace(string(b))
+	// Fallback: generate RFC 4122 v4 UUID via crypto/rand
+	var buf [16]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		log.Fatalf("cannot generate UUID: %v", err)
+	}
+	buf[6] = (buf[6] & 0x0f) | 0x40
+	buf[8] = (buf[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		buf[0:4], buf[4:6], buf[6:8], buf[8:10], buf[10:])
 }
 
 func main() {
@@ -229,7 +265,7 @@ func main() {
 		case <-pollTicker.C:
 			pollOnce(ctx, client, db, cfg)
 		default:
-			if !processOne(db, client, cfg.MaxTurnsPerSession) {
+			if !processOne(ctx, db, client, cfg.MaxTurnsPerSession) {
 				time.Sleep(500 * time.Millisecond)
 			}
 		}

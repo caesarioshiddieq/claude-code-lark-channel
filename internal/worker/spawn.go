@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -73,7 +74,7 @@ func ParseClaudeOutput(raw []byte) (string, error) {
 
 // SpawnClaude runs `claude -p` and returns the assistant reply.
 // isNew=true uses --session-id (first turn); false uses --resume.
-func SpawnClaude(sessionUUID string, isNew bool, prompt string) (string, error) {
+func SpawnClaude(ctx context.Context, sessionUUID string, isNew bool, prompt string) (string, error) {
 	args := []string{"-p", "--output-format", "json"}
 	if isNew {
 		args = append(args, "--session-id", sessionUUID)
@@ -82,7 +83,7 @@ func SpawnClaude(sessionUUID string, isNew bool, prompt string) (string, error) 
 	}
 	args = append(args, prompt)
 
-	cmd := exec.Command("claude", args...)
+	cmd := exec.CommandContext(ctx, "claude", args...)
 	out, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("claude spawn: %w", err)
