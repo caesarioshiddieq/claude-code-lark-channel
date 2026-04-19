@@ -12,9 +12,20 @@ import {
   formatUnknownCommandReply,
   formatStatusReply,
   formatHelpChannelReply,
+  routeSupervisorCommand,
+  validateRepoName,
+  formatSessionStarted,
+  formatSessionStopped,
+  formatSessionStatus,
+  formatNotActive,
+  formatUnauthorized,
+  formatOperationInProgress,
+  formatInvalidRepo,
   type LarkApiItem,
   type LarkChat,
   type StatusInfo,
+  type SupervisorRoute,
+  type SessionInfo,
 } from "./lib";
 
 // ---------------------------------------------------------------------------
@@ -826,5 +837,168 @@ describe("formatHelpChannelReply", () => {
     const result = formatHelpChannelReply(getAvailableCommands());
     expect(result).toContain("/clear");
     expect(result).toContain("/compact");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// routeSupervisorCommand
+// ---------------------------------------------------------------------------
+
+describe("routeSupervisorCommand", () => {
+  test("routes /start as lifecycle", () => {
+    const route = routeSupervisorCommand({ name: "start", args: "internal-affairs", raw: "/start internal-affairs" });
+    expect(route).toEqual({ kind: "lifecycle", command: "start" });
+  });
+
+  test("routes /stop as lifecycle", () => {
+    const route = routeSupervisorCommand({ name: "stop", args: "", raw: "/stop" });
+    expect(route).toEqual({ kind: "lifecycle", command: "stop" });
+  });
+
+  test("routes /restart as lifecycle", () => {
+    const route = routeSupervisorCommand({ name: "restart", args: "", raw: "/restart" });
+    expect(route).toEqual({ kind: "lifecycle", command: "restart" });
+  });
+
+  test("routes /status as query", () => {
+    const route = routeSupervisorCommand({ name: "status", args: "", raw: "/status" });
+    expect(route).toEqual({ kind: "query", command: "status" });
+  });
+
+  test("routes /help-channel as query", () => {
+    const route = routeSupervisorCommand({ name: "help-channel", args: "", raw: "/help-channel" });
+    expect(route).toEqual({ kind: "query", command: "help-channel" });
+  });
+
+  test("routes /clear as passthrough", () => {
+    const route = routeSupervisorCommand({ name: "clear", args: "", raw: "/clear" });
+    expect(route).toEqual({ kind: "passthrough" });
+  });
+
+  test("routes /compact as passthrough", () => {
+    const route = routeSupervisorCommand({ name: "compact", args: "", raw: "/compact" });
+    expect(route).toEqual({ kind: "passthrough" });
+  });
+
+  test("routes unknown command as unknown", () => {
+    const route = routeSupervisorCommand({ name: "foo", args: "", raw: "/foo" });
+    expect(route.kind).toBe("unknown");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// validateRepoName
+// ---------------------------------------------------------------------------
+
+describe("validateRepoName", () => {
+  const available = ["internal-affairs", "person-service", "kelola-app"];
+
+  test("returns valid repo name", () => {
+    expect(validateRepoName("internal-affairs", available)).toBe("internal-affairs");
+  });
+
+  test("returns null for unknown repo", () => {
+    expect(validateRepoName("nonexistent", available)).toBeNull();
+  });
+
+  test("strips path separators", () => {
+    expect(validateRepoName("../../../etc/passwd", available)).toBeNull();
+  });
+
+  test("strips tildes", () => {
+    expect(validateRepoName("~root", available)).toBeNull();
+  });
+
+  test("strips dots", () => {
+    expect(validateRepoName("..internal-affairs", available)).toBeNull();
+  });
+
+  test("returns null for empty string", () => {
+    expect(validateRepoName("", available)).toBeNull();
+  });
+
+  test("returns null for only special chars", () => {
+    expect(validateRepoName("../../../", available)).toBeNull();
+  });
+
+  test("allows hyphens and underscores", () => {
+    expect(validateRepoName("person-service", available)).toBe("person-service");
+  });
+
+  test("is case-sensitive", () => {
+    expect(validateRepoName("Internal-Affairs", available)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Supervisor formatters
+// ---------------------------------------------------------------------------
+
+describe("formatSessionStarted", () => {
+  test("contains repo name", () => {
+    expect(formatSessionStarted("internal-affairs")).toContain("internal-affairs");
+  });
+
+  test("indicates session started", () => {
+    expect(formatSessionStarted("person-service")).toContain("started");
+  });
+});
+
+describe("formatSessionStopped", () => {
+  test("indicates session stopped", () => {
+    expect(formatSessionStopped()).toContain("stopped");
+  });
+});
+
+describe("formatSessionStatus", () => {
+  test("shows running state with repo", () => {
+    const info: SessionInfo = {
+      running: true,
+      repo: "internal-affairs",
+      uptimeSeconds: 3661,
+      monitoredChats: ["oc_abc"],
+    };
+    const result = formatSessionStatus(info);
+    expect(result).toContain("Running");
+    expect(result).toContain("internal-affairs");
+    expect(result).toContain("1h 1m 1s");
+  });
+
+  test("shows stopped state", () => {
+    const info: SessionInfo = {
+      running: false,
+      repo: null,
+      uptimeSeconds: 0,
+      monitoredChats: ["oc_abc"],
+    };
+    const result = formatSessionStatus(info);
+    expect(result).toContain("Stopped");
+  });
+});
+
+describe("formatNotActive", () => {
+  test("suggests /start command", () => {
+    expect(formatNotActive()).toContain("/start");
+  });
+});
+
+describe("formatUnauthorized", () => {
+  test("indicates no permission", () => {
+    expect(formatUnauthorized()).toContain("permission");
+  });
+});
+
+describe("formatOperationInProgress", () => {
+  test("indicates busy", () => {
+    expect(formatOperationInProgress()).toContain("progress");
+  });
+});
+
+describe("formatInvalidRepo", () => {
+  test("shows invalid name and available repos", () => {
+    const result = formatInvalidRepo("bad-repo", ["internal-affairs", "person-service"]);
+    expect(result).toContain("bad-repo");
+    expect(result).toContain("internal-affairs");
+    expect(result).toContain("person-service");
   });
 });

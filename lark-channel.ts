@@ -30,6 +30,7 @@ import {
   formatHelpChannelReply,
   getAvailableCommands,
 } from "./lib";
+import { createLarkClient } from "./lark-client";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -61,86 +62,11 @@ const POLL_INTERVAL_MS = Math.max(1000, Number(process.env.LARK_POLL_INTERVAL ??
 // Lark API client
 // ---------------------------------------------------------------------------
 
-let appAccessToken = "";
-let tokenExpiresAt = 0;
-let refreshPromise: Promise<string> | null = null;
-
-async function doRefreshToken(): Promise<string> {
-  const res = await fetch(
-    `${BASE_URL}/auth/v3/app_access_token/internal`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json; charset=utf-8" },
-      body: JSON.stringify({ app_id: APP_ID, app_secret: APP_SECRET }),
-    }
-  );
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`[lark-channel] auth HTTP ${res.status}: ${body.slice(0, 500)}`);
-  }
-
-  const data = (await res.json()) as {
-    code: number;
-    msg: string;
-    app_access_token: string;
-    expire: number;
-  };
-
-  if (data.code !== 0) {
-    throw new Error(`[lark-channel] auth: ${data.msg}`);
-  }
-
-  appAccessToken = data.app_access_token;
-  tokenExpiresAt = Date.now() + data.expire * 1000;
-  return appAccessToken;
-}
-
-async function getAccessToken(): Promise<string> {
-  if (appAccessToken && Date.now() < tokenExpiresAt - 300_000) {
-    return appAccessToken;
-  }
-  // Prevent concurrent refresh requests
-  if (!refreshPromise) {
-    refreshPromise = doRefreshToken().finally(() => { refreshPromise = null; });
-  }
-  return refreshPromise;
-}
-
-async function larkFetch(url: string, init: RequestInit): Promise<unknown> {
-  const res = await fetch(url, init);
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`[lark-channel] HTTP ${res.status}: ${body.slice(0, 500)}`);
-  }
-  return res.json();
-}
-
-async function larkGet(path: string, params?: Record<string, string>) {
-  const token = await getAccessToken();
-  const url = new URL(`${BASE_URL}${path}`);
-  if (params) {
-    for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
-  }
-  return larkFetch(url.toString(), {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-}
-
-async function larkPost(path: string, body: unknown, params?: Record<string, string>) {
-  const token = await getAccessToken();
-  const url = new URL(`${BASE_URL}${path}`);
-  if (params) {
-    for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
-  }
-  return larkFetch(url.toString(), {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json; charset=utf-8",
-    },
-    body: JSON.stringify(body),
-  });
-}
+const lark = createLarkClient({
+  appId: APP_ID,
+  appSecret: APP_SECRET,
+  baseUrl: BASE_URL,
+});
 
 // ---------------------------------------------------------------------------
 // Chat discovery
@@ -175,7 +101,7 @@ async function pollChat(chat: LarkChat): Promise<LarkMessage[]> {
   do {
     const params = { ...baseParams };
     if (pageToken) params.page_token = pageToken;
-    const data = (await larkGet("/im/v1/messages", params)) as any;
+    const data = (await lark.get("/im/v1/messages", params)) as any;
     if (data.code !== 0) {
       console.error(`[lark-channel] poll ${chat.chat_id}: ${data.msg}`);
       return [];
@@ -285,7 +211,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
   if (name === "lark_reply") {
     const { chat_id, text } = z.object({ chat_id: z.string(), text: z.string() }).parse(args);
-    const data = (await larkPost(
+    const data = (await lark.post(
       "/im/v1/messages",
       {
         receive_id: chat_id,
@@ -312,7 +238,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
     const postContent = buildRichTextContent(content, title);
 
-    const data = (await larkPost(
+    const data = (await lark.post(
       "/im/v1/messages",
       {
         receive_id: chat_id,
@@ -370,7 +296,7 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
 
   for (const chatId of chats) {
     try {
-      await larkPost(
+      await lark.post(
         "/im/v1/messages",
         {
           receive_id: chatId,
@@ -411,7 +337,7 @@ function handleMcpCommand(handler: string): string {
 
 async function replyToChat(chatId: string, text: string): Promise<void> {
   try {
-    await larkPost(
+    await lark.post(
       "/im/v1/messages",
       {
         receive_id: chatId,
