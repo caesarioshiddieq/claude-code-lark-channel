@@ -1,0 +1,19 @@
+[Unit]
+Description=Claude Code VM Multi-Session Supervisor
+After=network.target
+
+[Service]
+Type=simple
+User=caesario
+WorkingDirectory=/home/caesario
+EnvironmentFile=/home/caesario/.config/claude-vm/env
+ExecStart=/home/caesario/bin/claude-vm-supervisor
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=claude-vm
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
