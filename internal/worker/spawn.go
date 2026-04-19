@@ -81,9 +81,8 @@ func SpawnClaude(ctx context.Context, sessionUUID string, isNew bool, prompt str
 	} else {
 		args = append(args, "--resume", sessionUUID)
 	}
-	args = append(args, prompt)
-
 	cmd := exec.CommandContext(ctx, "claude", args...)
+	cmd.Stdin = strings.NewReader(prompt)
 	out, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("claude spawn: %w", err)

@@ -1,6 +1,7 @@
 package sqlite
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -63,6 +64,10 @@ func Open(path string) (*DB, error) {
 		return nil, fmt.Errorf("sqlite open: %w", err)
 	}
 	db.SetMaxOpenConns(1)
+	if _, err := db.Exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("set WAL mode: %w", err)
+	}
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("sqlite schema: %w", err)
@@ -72,9 +77,8 @@ func Open(path string) (*DB, error) {
 
 func (d *DB) Close() error { return d.db.Close() }
 
-// Fix 3: wrap error with context
-func (d *DB) InsertInbox(taskID string, c lark.Comment) error {
-	_, err := d.db.Exec(
+func (d *DB) InsertInbox(ctx context.Context, taskID string, c lark.Comment) error {
+	_, err := d.db.ExecContext(ctx,
 		`INSERT OR IGNORE INTO inbox (comment_id, task_id, content, creator_id, created_at)
 		 VALUES (?, ?, ?, ?, ?)`,
 		c.CommentID, taskID, c.Content, c.Creator.ID, c.CreatedAt,
@@ -85,10 +89,9 @@ func (d *DB) InsertInbox(taskID string, c lark.Comment) error {
 	return nil
 }
 
-// Fix 1: errors.Is; Fix 4: explicit return pattern
-func (d *DB) NextInboxRow() (InboxRow, bool, error) {
+func (d *DB) NextInboxRow(ctx context.Context) (InboxRow, bool, error) {
 	var row InboxRow
-	err := d.db.QueryRow(
+	err := d.db.QueryRowContext(ctx,
 		`SELECT comment_id, task_id, content, creator_id FROM inbox
 		 WHERE processed_at IS NULL ORDER BY created_at ASC LIMIT 1`,
 	).Scan(&row.CommentID, &row.TaskID, &row.Content, &row.CreatorID)
@@ -101,9 +104,8 @@ func (d *DB) NextInboxRow() (InboxRow, bool, error) {
 	return row, true, nil
 }
 
-// Fix 3: wrap error with context
-func (d *DB) MarkInboxProcessed(commentID string) error {
-	_, err := d.db.Exec(`UPDATE inbox SET processed_at = ? WHERE comment_id = ?`,
+func (d *DB) MarkInboxProcessed(ctx context.Context, commentID string) error {
+	_, err := d.db.ExecContext(ctx, `UPDATE inbox SET processed_at = ? WHERE comment_id = ?`,
 		time.Now().Unix(), commentID)
 	if err != nil {
 		return fmt.Errorf("mark inbox processed: %w", err)
@@ -111,28 +113,26 @@ func (d *DB) MarkInboxProcessed(commentID string) error {
 	return nil
 }
 
-// Fix 2: explicit rollback discard
-func (d *DB) MoveToDeadLetter(commentID, taskID, lastError string) error {
-	tx, err := d.db.Begin()
+func (d *DB) MoveToDeadLetter(ctx context.Context, commentID, taskID, lastError string) error {
+	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.Exec(
+	if _, err := tx.ExecContext(ctx,
 		`INSERT OR REPLACE INTO dlq (comment_id, task_id, last_error, moved_at) VALUES (?,?,?,?)`,
 		commentID, taskID, lastError, time.Now().Unix()); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`DELETE FROM inbox WHERE comment_id = ?`, commentID); err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM inbox WHERE comment_id = ?`, commentID); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-// Fix 1: errors.Is
-func (d *DB) GetSession(taskID string) (string, bool, error) {
+func (d *DB) GetSession(ctx context.Context, taskID string) (string, bool, error) {
 	var uuid sql.NullString
-	err := d.db.QueryRow(`SELECT session_uuid FROM sessions WHERE task_id = ?`, taskID).Scan(&uuid)
+	err := d.db.QueryRowContext(ctx, `SELECT session_uuid FROM sessions WHERE task_id = ?`, taskID).Scan(&uuid)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, nil
 	}
@@ -142,9 +142,9 @@ func (d *DB) GetSession(taskID string) (string, bool, error) {
 	return uuid.String, true, nil
 }
 
-func (d *DB) UpsertSession(taskID, sessionUUID string) error {
+func (d *DB) UpsertSession(ctx context.Context, taskID, sessionUUID string) error {
 	now := time.Now().Unix()
-	_, err := d.db.Exec(
+	_, err := d.db.ExecContext(ctx,
 		`INSERT INTO sessions (task_id, session_uuid, created_at, last_active, turn_count)
 		 VALUES (?, ?, ?, ?, 0)
 		 ON CONFLICT(task_id) DO UPDATE SET session_uuid=excluded.session_uuid, last_active=excluded.last_active`,
@@ -152,9 +152,8 @@ func (d *DB) UpsertSession(taskID, sessionUUID string) error {
 	return err
 }
 
-// Fix 3: wrap error with context
-func (d *DB) IncrTurnCount(taskID string) error {
-	_, err := d.db.Exec(
+func (d *DB) IncrTurnCount(ctx context.Context, taskID string) error {
+	_, err := d.db.ExecContext(ctx,
 		`UPDATE sessions SET turn_count=turn_count+1, last_active=? WHERE task_id=?`,
 		time.Now().Unix(), taskID)
 	if err != nil {
@@ -163,20 +162,18 @@ func (d *DB) IncrTurnCount(taskID string) error {
 	return nil
 }
 
-// Fix 1: errors.Is
-func (d *DB) GetTurnCount(taskID string) (int, error) {
+func (d *DB) GetTurnCount(ctx context.Context, taskID string) (int, error) {
 	var n int
-	err := d.db.QueryRow(`SELECT turn_count FROM sessions WHERE task_id=?`, taskID).Scan(&n)
+	err := d.db.QueryRowContext(ctx, `SELECT turn_count FROM sessions WHERE task_id=?`, taskID).Scan(&n)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, nil
 	}
 	return n, err
 }
 
-// Fix 1: errors.Is; Fix 4: explicit return pattern
-func (d *DB) GetWatermark(taskID string) (string, bool, error) {
+func (d *DB) GetWatermark(ctx context.Context, taskID string) (string, bool, error) {
 	var id string
-	err := d.db.QueryRow(`SELECT last_seen_comment_id FROM watermark WHERE task_id=?`, taskID).Scan(&id)
+	err := d.db.QueryRowContext(ctx, `SELECT last_seen_comment_id FROM watermark WHERE task_id=?`, taskID).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, nil
 	}
@@ -186,18 +183,17 @@ func (d *DB) GetWatermark(taskID string) (string, bool, error) {
 	return id, true, nil
 }
 
-func (d *DB) SetWatermark(taskID, commentID string) error {
-	_, err := d.db.Exec(
+func (d *DB) SetWatermark(ctx context.Context, taskID, commentID string) error {
+	_, err := d.db.ExecContext(ctx,
 		`INSERT INTO watermark (task_id, last_seen_comment_id) VALUES (?,?)
 		 ON CONFLICT(task_id) DO UPDATE SET last_seen_comment_id=excluded.last_seen_comment_id`,
 		taskID, commentID)
 	return err
 }
 
-// Fix 1: errors.Is
-func (d *DB) OutboxCheck(hash string) (string, bool, error) {
+func (d *DB) OutboxCheck(ctx context.Context, hash string) (string, bool, error) {
 	var larkID sql.NullString
-	err := d.db.QueryRow(`SELECT lark_comment_id FROM outbox WHERE content_hash=?`, hash).Scan(&larkID)
+	err := d.db.QueryRowContext(ctx, `SELECT lark_comment_id FROM outbox WHERE content_hash=?`, hash).Scan(&larkID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, nil
 	}
@@ -207,9 +203,8 @@ func (d *DB) OutboxCheck(hash string) (string, bool, error) {
 	return larkID.String, true, nil
 }
 
-// Fix 3: wrap error with context
-func (d *DB) OutboxInsert(hash, taskID, replyToCommentID string) error {
-	_, err := d.db.Exec(
+func (d *DB) OutboxInsert(ctx context.Context, hash, taskID, replyToCommentID string) error {
+	_, err := d.db.ExecContext(ctx,
 		`INSERT OR IGNORE INTO outbox (content_hash, task_id, reply_to_comment_id, created_at)
 		 VALUES (?,?,?,?)`,
 		hash, taskID, replyToCommentID, time.Now().Unix())
@@ -219,9 +214,8 @@ func (d *DB) OutboxInsert(hash, taskID, replyToCommentID string) error {
 	return nil
 }
 
-// Fix 3: wrap error with context
-func (d *DB) OutboxMarkPosted(hash, larkCommentID string) error {
-	_, err := d.db.Exec(
+func (d *DB) OutboxMarkPosted(ctx context.Context, hash, larkCommentID string) error {
+	_, err := d.db.ExecContext(ctx,
 		`UPDATE outbox SET lark_comment_id=?, posted_at=? WHERE content_hash=?`,
 		larkCommentID, time.Now().Unix(), hash)
 	if err != nil {

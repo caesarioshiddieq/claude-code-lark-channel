@@ -105,7 +105,7 @@ func pollOnce(ctx context.Context, client *lark.Client, db *q.DB, cfg config) {
 }
 
 func pollTask(ctx context.Context, client *lark.Client, db *q.DB, taskID string, allowList []string) {
-	watermark, _, err := db.GetWatermark(taskID)
+	watermark, _, err := db.GetWatermark(ctx, taskID)
 	if err != nil {
 		log.Printf("[poller] get watermark task=%s: %v", taskID, err)
 		return
@@ -128,7 +128,7 @@ func pollTask(ctx context.Context, client *lark.Client, db *q.DB, taskID string,
 			if watermark != "" && c.CommentID <= watermark {
 				continue
 			}
-			if err := db.InsertInbox(taskID, c); err != nil {
+			if err := db.InsertInbox(ctx, taskID, c); err != nil {
 				log.Printf("[poller] insert inbox task=%s comment=%s: %v", taskID, c.CommentID, err)
 			}
 			if latestID == "" || c.CommentID > latestID {
@@ -141,14 +141,14 @@ func pollTask(ctx context.Context, client *lark.Client, db *q.DB, taskID string,
 		pageToken = resp.PageToken
 	}
 	if latestID != "" {
-		if err := db.SetWatermark(taskID, latestID); err != nil {
+		if err := db.SetWatermark(ctx, taskID, latestID); err != nil {
 			log.Printf("[poller] set watermark task=%s: %v", taskID, err)
 		}
 	}
 }
 
 func processOne(ctx context.Context, db *q.DB, client *lark.Client, maxTurns int) bool {
-	row, found, err := db.NextInboxRow()
+	row, found, err := db.NextInboxRow(ctx)
 	if err != nil {
 		log.Printf("[worker] next inbox: %v", err)
 		return false
@@ -164,7 +164,7 @@ func processOne(ctx context.Context, db *q.DB, client *lark.Client, maxTurns int
 	}
 	defer worker.UnlockTask(lockFile)
 
-	sessionUUID, found, err := db.GetSession(row.TaskID)
+	sessionUUID, found, err := db.GetSession(ctx, row.TaskID)
 	if err != nil {
 		log.Printf("[worker] get session task=%s: %v", row.TaskID, err)
 		return false
@@ -172,23 +172,32 @@ func processOne(ctx context.Context, db *q.DB, client *lark.Client, maxTurns int
 	isNew := !found
 	if isNew {
 		sessionUUID = newUUID()
-		if err := db.UpsertSession(row.TaskID, sessionUUID); err != nil {
+		if err := db.UpsertSession(ctx, row.TaskID, sessionUUID); err != nil {
 			log.Printf("[worker] upsert session task=%s: %v", row.TaskID, err)
 			return false
 		}
 	}
 
 	prompt := row.Content
-	if turns, _ := db.GetTurnCount(row.TaskID); turns > 0 && turns%maxTurns == 0 {
+	turns, err := db.GetTurnCount(ctx, row.TaskID)
+	if err != nil {
+		log.Printf("[worker] get turn count task=%s: %v", row.TaskID, err)
+	}
+	if turns > 0 && turns%maxTurns == 0 {
 		prompt = "/compact\n\n" + prompt
 	}
 
 	reply, err := worker.SpawnClaude(ctx, sessionUUID, isNew, prompt)
 	if err != nil {
+		if ctx.Err() != nil {
+			// Graceful shutdown: leave row in inbox for next startup to retry.
+			log.Printf("[worker] spawn cancelled (shutdown), leaving task=%s comment=%s in inbox", row.TaskID, row.CommentID)
+			return false
+		}
 		log.Printf("[worker] spawn task=%s comment=%s: %v", row.TaskID, row.CommentID, err)
-		if dlqErr := db.MoveToDeadLetter(row.CommentID, row.TaskID, err.Error()); dlqErr != nil {
+		if dlqErr := db.MoveToDeadLetter(ctx, row.CommentID, row.TaskID, err.Error()); dlqErr != nil {
 			log.Printf("[worker] dlq move failed task=%s comment=%s: %v; marking processed", row.TaskID, row.CommentID, dlqErr)
-			if mErr := db.MarkInboxProcessed(row.CommentID); mErr != nil {
+			if mErr := db.MarkInboxProcessed(ctx, row.CommentID); mErr != nil {
 				log.Printf("[worker] mark processed fallback failed comment=%s: %v", row.CommentID, mErr)
 			}
 		}
@@ -196,25 +205,43 @@ func processOne(ctx context.Context, db *q.DB, client *lark.Client, maxTurns int
 	}
 
 	hash := worker.ContentHash(row.TaskID, reply)
-	existingID, found, outboxErr := db.OutboxCheck(hash)
+	existingID, found, outboxErr := db.OutboxCheck(ctx, hash)
 	if outboxErr != nil {
 		log.Printf("[worker] outbox check task=%s: %v", row.TaskID, outboxErr)
 	}
-	if found && existingID != "" {
-		log.Printf("[worker] reply already posted (outbox hit) task=%s", row.TaskID)
-	} else {
-		db.OutboxInsert(hash, row.TaskID, row.CommentID) //nolint:errcheck
-		if newCommentID, err := client.PostComment(ctx, row.TaskID, reply, row.CommentID); err != nil {
-			log.Printf("[worker] post comment task=%s: %v", row.TaskID, err)
+	if found {
+		if existingID != "" {
+			log.Printf("[worker] reply already posted (outbox hit) task=%s", row.TaskID)
 		} else {
-			db.OutboxMarkPosted(hash, newCommentID) //nolint:errcheck
+			// Crash-recovery: hash recorded but lark_comment_id not confirmed; re-post.
+			log.Printf("[worker] outbox half-posted state (re-posting) task=%s", row.TaskID)
+			if newCommentID, err := client.PostComment(ctx, row.TaskID, reply, row.CommentID); err != nil {
+				log.Printf("[worker] post comment task=%s: %v", row.TaskID, err)
+			} else {
+				if err := db.OutboxMarkPosted(ctx, hash, newCommentID); err != nil {
+					log.Printf("[worker] outbox mark posted task=%s: %v", row.TaskID, err)
+				}
+			}
+		}
+	} else {
+		// Write-before-post: record hash before calling Lark to enable dedup on retry.
+		if err := db.OutboxInsert(ctx, hash, row.TaskID, row.CommentID); err != nil {
+			log.Printf("[worker] outbox insert task=%s: %v; aborting post to preserve dedup", row.TaskID, err)
+		} else {
+			if newCommentID, err := client.PostComment(ctx, row.TaskID, reply, row.CommentID); err != nil {
+				log.Printf("[worker] post comment task=%s: %v", row.TaskID, err)
+			} else {
+				if err := db.OutboxMarkPosted(ctx, hash, newCommentID); err != nil {
+					log.Printf("[worker] outbox mark posted task=%s: %v", row.TaskID, err)
+				}
+			}
 		}
 	}
 
-	if err := db.MarkInboxProcessed(row.CommentID); err != nil {
+	if err := db.MarkInboxProcessed(ctx, row.CommentID); err != nil {
 		log.Printf("[worker] mark processed comment=%s: %v", row.CommentID, err)
 	}
-	if err := db.IncrTurnCount(row.TaskID); err != nil {
+	if err := db.IncrTurnCount(ctx, row.TaskID); err != nil {
 		log.Printf("[worker] incr turn count task=%s: %v", row.TaskID, err)
 	}
 	return true
@@ -255,19 +282,28 @@ func main() {
 	defer pollTicker.Stop()
 
 	log.Printf("[supervisor] started (tasklist=%s poll=%s db=%s)", cfg.TasklistID, cfg.PollInterval, cfg.DBPath)
-	pollOnce(ctx, client, db, cfg)
 
-	for {
-		select {
-		case <-ctx.Done():
-			log.Println("[supervisor] shutting down")
-			return
-		case <-pollTicker.C:
-			pollOnce(ctx, client, db, cfg)
-		default:
-			if !processOne(ctx, db, client, cfg.MaxTurnsPerSession) {
-				time.Sleep(500 * time.Millisecond)
+	// Poller runs in its own goroutine so Claude subprocess duration doesn't delay poll ticks.
+	go func() {
+		pollOnce(ctx, client, db, cfg)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-pollTicker.C:
+				pollOnce(ctx, client, db, cfg)
+			}
+		}
+	}()
+
+	// Worker loop: drain inbox continuously; sleep 500ms when queue is empty.
+	for ctx.Err() == nil {
+		if !processOne(ctx, db, client, cfg.MaxTurnsPerSession) {
+			select {
+			case <-ctx.Done():
+			case <-time.After(500 * time.Millisecond):
 			}
 		}
 	}
+	log.Println("[supervisor] shutting down")
 }

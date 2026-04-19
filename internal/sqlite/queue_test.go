@@ -1,6 +1,7 @@
 package sqlite_test
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -19,18 +20,19 @@ func openTestDB(t *testing.T) *q.DB {
 }
 
 func TestInbox_InsertAndFetch(t *testing.T) {
+	ctx := context.Background()
 	db := openTestDB(t)
 	c := lark.Comment{CommentID: "c1", Content: "hello", CreatedAt: time.Now().UnixMilli(),
 		Creator: lark.Creator{ID: "u1", Type: "user"}}
 
-	if err := db.InsertInbox("task-1", c); err != nil {
+	if err := db.InsertInbox(ctx, "task-1", c); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.InsertInbox("task-1", c); err != nil {
+	if err := db.InsertInbox(ctx, "task-1", c); err != nil {
 		t.Fatalf("duplicate insert should be ignored, got: %v", err)
 	}
 
-	row, found, err := db.NextInboxRow()
+	row, found, err := db.NextInboxRow(ctx)
 	if err != nil || !found {
 		t.Fatalf("expected row: err=%v found=%v", err, found)
 	}
@@ -40,18 +42,19 @@ func TestInbox_InsertAndFetch(t *testing.T) {
 }
 
 func TestWatermark_SetAndGet(t *testing.T) {
+	ctx := context.Background()
 	db := openTestDB(t)
-	_, found, err := db.GetWatermark("task-1")
+	_, found, err := db.GetWatermark(ctx, "task-1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if found {
 		t.Fatal("expected no watermark initially")
 	}
-	if err := db.SetWatermark("task-1", "c42"); err != nil {
+	if err := db.SetWatermark(ctx, "task-1", "c42"); err != nil {
 		t.Fatal(err)
 	}
-	wm, found, err := db.GetWatermark("task-1")
+	wm, found, err := db.GetWatermark(ctx, "task-1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,18 +64,19 @@ func TestWatermark_SetAndGet(t *testing.T) {
 }
 
 func TestSession_UpsertAndGet(t *testing.T) {
+	ctx := context.Background()
 	db := openTestDB(t)
-	_, found, err := db.GetSession("task-1")
+	_, found, err := db.GetSession(ctx, "task-1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if found {
 		t.Fatal("expected no session initially")
 	}
-	if err := db.UpsertSession("task-1", "uuid-abc"); err != nil {
+	if err := db.UpsertSession(ctx, "task-1", "uuid-abc"); err != nil {
 		t.Fatal(err)
 	}
-	uuid, found, err := db.GetSession("task-1")
+	uuid, found, err := db.GetSession(ctx, "task-1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,18 +86,19 @@ func TestSession_UpsertAndGet(t *testing.T) {
 }
 
 func TestOutbox_InsertCheckMarkPosted(t *testing.T) {
+	ctx := context.Background()
 	db := openTestDB(t)
-	_, found, err := db.OutboxCheck("hash1")
+	_, found, err := db.OutboxCheck(ctx, "hash1")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if found {
 		t.Fatal("expected no outbox row initially")
 	}
-	if err := db.OutboxInsert("hash1", "task-1", "c1"); err != nil {
+	if err := db.OutboxInsert(ctx, "hash1", "task-1", "c1"); err != nil {
 		t.Fatal(err)
 	}
-	larkID, found, err := db.OutboxCheck("hash1")
+	larkID, found, err := db.OutboxCheck(ctx, "hash1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,10 +108,10 @@ func TestOutbox_InsertCheckMarkPosted(t *testing.T) {
 	if larkID != "" {
 		t.Fatalf("expected null lark_comment_id, got %s", larkID)
 	}
-	if err := db.OutboxMarkPosted("hash1", "new-c99"); err != nil {
+	if err := db.OutboxMarkPosted(ctx, "hash1", "new-c99"); err != nil {
 		t.Fatal(err)
 	}
-	larkID, found, err = db.OutboxCheck("hash1")
+	larkID, found, err = db.OutboxCheck(ctx, "hash1")
 	if err != nil {
 		t.Fatal(err)
 	}
