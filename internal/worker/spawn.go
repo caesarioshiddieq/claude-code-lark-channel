@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 )
 
@@ -21,6 +22,11 @@ func lockDir() string {
 // Caller must call UnlockTask when done.
 func LockTask(taskID string) (*os.File, error) {
 	lockPath := filepath.Join(lockDir(), taskID, "lock")
+	// Guard against path traversal: ensure lockPath stays within lockDir()
+	base := filepath.Clean(lockDir()) + string(os.PathSeparator)
+	if !strings.HasPrefix(filepath.Clean(lockPath), base) {
+		return nil, fmt.Errorf("invalid taskID %q: path escapes lock directory", taskID)
+	}
 	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
 		return nil, fmt.Errorf("mkdir lock dir: %w", err)
 	}

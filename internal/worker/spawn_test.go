@@ -35,6 +35,16 @@ func TestLockTask_AcquireRelease(t *testing.T) {
 	worker.UnlockTask(f)
 }
 
+func TestLockTask_RejectsPathTraversal(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("LOCK_DIR", dir)
+
+	_, err := worker.LockTask("../escape")
+	if err == nil {
+		t.Fatal("expected error for path traversal taskID")
+	}
+}
+
 func TestParseClaudeOutput_ExtractsResult(t *testing.T) {
 	raw := []byte(`{"type":"result","subtype":"success","is_error":false,"result":"hello from claude","session_id":"s1","cost_usd":0.01}`)
 	result, err := worker.ParseClaudeOutput(raw)
