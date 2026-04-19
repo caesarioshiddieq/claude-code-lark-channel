@@ -25,7 +25,10 @@ sudo chown -R caesario:caesario /var/lib/claude-vm
 # Create config directory and populate env file
 mkdir -p /home/caesario/bin ~/.config/claude-vm
 cp infra/env.example ~/.config/claude-vm/env
+chmod 600 ~/.config/claude-vm/env   # restrict: file contains LARK_APP_SECRET
 # Edit the env file — at minimum set LARK_APP_SECRET and LARK_TASKLIST_ID
+# SECURITY: set CLAUDE_ALLOW_LIST to your operator Lark open_ids before production.
+# An empty value allows ALL Lark users to invoke Claude on this VM.
 $EDITOR ~/.config/claude-vm/env
 
 # Deploy binary and service unit
