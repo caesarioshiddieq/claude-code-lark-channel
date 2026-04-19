@@ -41,14 +41,20 @@ func TestInbox_InsertAndFetch(t *testing.T) {
 
 func TestWatermark_SetAndGet(t *testing.T) {
 	db := openTestDB(t)
-	_, found, _ := db.GetWatermark("task-1")
+	_, found, err := db.GetWatermark("task-1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if found {
 		t.Fatal("expected no watermark initially")
 	}
 	if err := db.SetWatermark("task-1", "c42"); err != nil {
 		t.Fatal(err)
 	}
-	wm, found, _ := db.GetWatermark("task-1")
+	wm, found, err := db.GetWatermark("task-1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !found || wm != "c42" {
 		t.Fatalf("want c42, got %s found=%v", wm, found)
 	}
@@ -56,14 +62,20 @@ func TestWatermark_SetAndGet(t *testing.T) {
 
 func TestSession_UpsertAndGet(t *testing.T) {
 	db := openTestDB(t)
-	_, found, _ := db.GetSession("task-1")
+	_, found, err := db.GetSession("task-1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if found {
 		t.Fatal("expected no session initially")
 	}
 	if err := db.UpsertSession("task-1", "uuid-abc"); err != nil {
 		t.Fatal(err)
 	}
-	uuid, found, _ := db.GetSession("task-1")
+	uuid, found, err := db.GetSession("task-1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !found || uuid != "uuid-abc" {
 		t.Fatalf("want uuid-abc, got %s found=%v", uuid, found)
 	}
@@ -71,14 +83,20 @@ func TestSession_UpsertAndGet(t *testing.T) {
 
 func TestOutbox_InsertCheckMarkPosted(t *testing.T) {
 	db := openTestDB(t)
-	_, found, _ := db.OutboxCheck("hash1")
+	_, found, err := db.OutboxCheck("hash1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if found {
 		t.Fatal("expected no outbox row initially")
 	}
 	if err := db.OutboxInsert("hash1", "task-1", "c1"); err != nil {
 		t.Fatal(err)
 	}
-	larkID, found, _ := db.OutboxCheck("hash1")
+	larkID, found, err := db.OutboxCheck("hash1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !found {
 		t.Fatal("expected outbox row after insert")
 	}
@@ -88,7 +106,10 @@ func TestOutbox_InsertCheckMarkPosted(t *testing.T) {
 	if err := db.OutboxMarkPosted("hash1", "new-c99"); err != nil {
 		t.Fatal(err)
 	}
-	larkID, found, _ = db.OutboxCheck("hash1")
+	larkID, found, err = db.OutboxCheck("hash1")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !found || larkID != "new-c99" {
 		t.Fatalf("want new-c99, got %s found=%v", larkID, found)
 	}

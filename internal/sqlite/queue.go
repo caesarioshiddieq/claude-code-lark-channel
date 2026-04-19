@@ -2,6 +2,7 @@ package sqlite
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -71,39 +72,52 @@ func Open(path string) (*DB, error) {
 
 func (d *DB) Close() error { return d.db.Close() }
 
+// Fix 3: wrap error with context
 func (d *DB) InsertInbox(taskID string, c lark.Comment) error {
 	_, err := d.db.Exec(
 		`INSERT OR IGNORE INTO inbox (comment_id, task_id, content, creator_id, created_at)
 		 VALUES (?, ?, ?, ?, ?)`,
 		c.CommentID, taskID, c.Content, c.Creator.ID, c.CreatedAt,
 	)
-	return err
+	if err != nil {
+		return fmt.Errorf("insert inbox: %w", err)
+	}
+	return nil
 }
 
+// Fix 1: errors.Is; Fix 4: explicit return pattern
 func (d *DB) NextInboxRow() (InboxRow, bool, error) {
 	var row InboxRow
 	err := d.db.QueryRow(
 		`SELECT comment_id, task_id, content, creator_id FROM inbox
 		 WHERE processed_at IS NULL ORDER BY created_at ASC LIMIT 1`,
 	).Scan(&row.CommentID, &row.TaskID, &row.Content, &row.CreatorID)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return InboxRow{}, false, nil
 	}
-	return row, err == nil, err
+	if err != nil {
+		return InboxRow{}, false, err
+	}
+	return row, true, nil
 }
 
+// Fix 3: wrap error with context
 func (d *DB) MarkInboxProcessed(commentID string) error {
 	_, err := d.db.Exec(`UPDATE inbox SET processed_at = ? WHERE comment_id = ?`,
 		time.Now().Unix(), commentID)
-	return err
+	if err != nil {
+		return fmt.Errorf("mark inbox processed: %w", err)
+	}
+	return nil
 }
 
+// Fix 2: explicit rollback discard
 func (d *DB) MoveToDeadLetter(commentID, taskID, lastError string) error {
 	tx, err := d.db.Begin()
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	if _, err := tx.Exec(
 		`INSERT OR REPLACE INTO dlq (comment_id, task_id, last_error, moved_at) VALUES (?,?,?,?)`,
 		commentID, taskID, lastError, time.Now().Unix()); err != nil {
@@ -115,10 +129,11 @@ func (d *DB) MoveToDeadLetter(commentID, taskID, lastError string) error {
 	return tx.Commit()
 }
 
+// Fix 1: errors.Is
 func (d *DB) GetSession(taskID string) (string, bool, error) {
 	var uuid sql.NullString
 	err := d.db.QueryRow(`SELECT session_uuid FROM sessions WHERE task_id = ?`, taskID).Scan(&uuid)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, nil
 	}
 	if err != nil || !uuid.Valid {
@@ -137,29 +152,38 @@ func (d *DB) UpsertSession(taskID, sessionUUID string) error {
 	return err
 }
 
+// Fix 3: wrap error with context
 func (d *DB) IncrTurnCount(taskID string) error {
 	_, err := d.db.Exec(
 		`UPDATE sessions SET turn_count=turn_count+1, last_active=? WHERE task_id=?`,
 		time.Now().Unix(), taskID)
-	return err
+	if err != nil {
+		return fmt.Errorf("incr turn count: %w", err)
+	}
+	return nil
 }
 
+// Fix 1: errors.Is
 func (d *DB) GetTurnCount(taskID string) (int, error) {
 	var n int
 	err := d.db.QueryRow(`SELECT turn_count FROM sessions WHERE task_id=?`, taskID).Scan(&n)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return 0, nil
 	}
 	return n, err
 }
 
+// Fix 1: errors.Is; Fix 4: explicit return pattern
 func (d *DB) GetWatermark(taskID string) (string, bool, error) {
 	var id string
 	err := d.db.QueryRow(`SELECT last_seen_comment_id FROM watermark WHERE task_id=?`, taskID).Scan(&id)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, nil
 	}
-	return id, err == nil, err
+	if err != nil {
+		return "", false, err
+	}
+	return id, true, nil
 }
 
 func (d *DB) SetWatermark(taskID, commentID string) error {
@@ -170,10 +194,11 @@ func (d *DB) SetWatermark(taskID, commentID string) error {
 	return err
 }
 
+// Fix 1: errors.Is
 func (d *DB) OutboxCheck(hash string) (string, bool, error) {
 	var larkID sql.NullString
 	err := d.db.QueryRow(`SELECT lark_comment_id FROM outbox WHERE content_hash=?`, hash).Scan(&larkID)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return "", false, nil
 	}
 	if err != nil {
@@ -182,17 +207,25 @@ func (d *DB) OutboxCheck(hash string) (string, bool, error) {
 	return larkID.String, true, nil
 }
 
+// Fix 3: wrap error with context
 func (d *DB) OutboxInsert(hash, taskID, replyToCommentID string) error {
 	_, err := d.db.Exec(
 		`INSERT OR IGNORE INTO outbox (content_hash, task_id, reply_to_comment_id, created_at)
 		 VALUES (?,?,?,?)`,
 		hash, taskID, replyToCommentID, time.Now().Unix())
-	return err
+	if err != nil {
+		return fmt.Errorf("outbox insert: %w", err)
+	}
+	return nil
 }
 
+// Fix 3: wrap error with context
 func (d *DB) OutboxMarkPosted(hash, larkCommentID string) error {
 	_, err := d.db.Exec(
 		`UPDATE outbox SET lark_comment_id=?, posted_at=? WHERE content_hash=?`,
 		larkCommentID, time.Now().Unix(), hash)
-	return err
+	if err != nil {
+		return fmt.Errorf("outbox mark posted: %w", err)
+	}
+	return nil
 }
