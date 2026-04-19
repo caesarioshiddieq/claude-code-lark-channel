@@ -4,10 +4,22 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"regexp"
 	"sync"
 	"time"
 )
+
+// validID guards against path-traversal / injection via user-supplied IDs.
+var validID = regexp.MustCompile(`^[a-zA-Z0-9_\-]+$`)
+
+func validateID(id, field string) error {
+	if !validID.MatchString(id) {
+		return fmt.Errorf("invalid %s: %q", field, id)
+	}
+	return nil
+}
 
 type Config struct {
 	AppID     string
@@ -51,9 +63,13 @@ func (c *Client) ensureToken() (string, error) {
 	if c.token != "" && time.Now().Before(c.tokenExp) {
 		return c.token, nil
 	}
-	body, _ := json.Marshal(map[string]string{
+	// Fix 1: handle json.Marshal error instead of ignoring it.
+	body, err := json.Marshal(map[string]string{
 		"app_id": c.cfg.AppID, "app_secret": c.cfg.AppSecret,
 	})
+	if err != nil {
+		return "", fmt.Errorf("lark auth marshal: %w", err)
+	}
 	resp, err := c.httpClient.Post(
 		c.cfg.BaseURL+"/auth/v3/app_access_token/internal",
 		"application/json", bytes.NewReader(body),
@@ -117,6 +133,10 @@ func (c *Client) doPOST(path string, body any) (*http.Response, error) {
 
 // ListComments fetches one page of comments for taskID. Pass pageToken="" for first page.
 func (c *Client) ListComments(taskID, pageToken string) (ListCommentsResult, error) {
+	// Fix 2: validate taskID before URL interpolation.
+	if err := validateID(taskID, "taskID"); err != nil {
+		return ListCommentsResult{}, err
+	}
 	params := map[string]string{"page_size": "50"}
 	if pageToken != "" {
 		params["page_token"] = pageToken
@@ -126,6 +146,11 @@ func (c *Client) ListComments(taskID, pageToken string) (ListCommentsResult, err
 		return ListCommentsResult{}, err
 	}
 	defer resp.Body.Close()
+	// Fix 4: check HTTP status before decoding.
+	if resp.StatusCode >= 400 {
+		b, _ := io.ReadAll(resp.Body)
+		return ListCommentsResult{}, fmt.Errorf("lark API HTTP %d: %s", resp.StatusCode, b)
+	}
 	var out struct {
 		Code int    `json:"code"`
 		Msg  string `json:"msg"`
@@ -160,6 +185,11 @@ func (c *Client) PostComment(taskID, content, replyToCommentID string) (string, 
 		return "", err
 	}
 	defer resp.Body.Close()
+	// Fix 4: check HTTP status before decoding.
+	if resp.StatusCode >= 400 {
+		b, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("lark API HTTP %d: %s", resp.StatusCode, b)
+	}
 	var out struct {
 		Code int    `json:"code"`
 		Msg  string `json:"msg"`
@@ -179,6 +209,10 @@ func (c *Client) PostComment(taskID, content, replyToCommentID string) (string, 
 // ListTasklistTasks returns GUIDs of all non-completed tasks in a tasklist.
 // ⚠ Verify "guid" field name against Lark Task v2 API docs before deploying.
 func (c *Client) ListTasklistTasks(tasklistID string) ([]string, error) {
+	// Fix 2: validate tasklistID before URL interpolation.
+	if err := validateID(tasklistID, "tasklistID"); err != nil {
+		return nil, err
+	}
 	pageToken := ""
 	var taskIDs []string
 	for {
@@ -201,11 +235,19 @@ func (c *Client) ListTasklistTasks(tasklistID string) ([]string, error) {
 				PageToken string `json:"page_token"`
 			} `json:"data"`
 		}
-		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-			resp.Body.Close()
-			return nil, fmt.Errorf("list tasklist tasks decode: %w", err)
+		// Fix 3: use inline closure so defer fires before next iteration.
+		// Fix 4: check HTTP status before decoding.
+		decErr := func() error {
+			defer resp.Body.Close()
+			if resp.StatusCode >= 400 {
+				b, _ := io.ReadAll(resp.Body)
+				return fmt.Errorf("lark API HTTP %d: %s", resp.StatusCode, b)
+			}
+			return json.NewDecoder(resp.Body).Decode(&out)
+		}()
+		if decErr != nil {
+			return nil, fmt.Errorf("list tasklist tasks decode: %w", decErr)
 		}
-		resp.Body.Close()
 		if out.Code != 0 {
 			return nil, fmt.Errorf("list tasklist tasks: %s", out.Msg)
 		}

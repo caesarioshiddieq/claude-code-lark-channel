@@ -66,3 +66,29 @@ func TestPostComment_ReturnsCommentID(t *testing.T) {
 		t.Fatalf("want new-c99, got %s", commentID)
 	}
 }
+func TestListTasklistTasks_ReturnsGUIDs(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/auth/v3/app_access_token/internal" {
+			authHandler(w, r)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"code": 0,
+			"data": map[string]any{
+				"items":      []map[string]any{{"guid": "t1"}, {"guid": "t2"}},
+				"has_more":   false,
+				"page_token": "",
+			},
+		})
+	}))
+	defer srv.Close()
+
+	c := lark.NewClient(lark.Config{AppID: "id", AppSecret: "sec", BaseURL: srv.URL})
+	ids, err := c.ListTasklistTasks("tl-abc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 2 || ids[0] != "t1" || ids[1] != "t2" {
+		t.Fatalf("unexpected ids: %v", ids)
+	}
+}
