@@ -251,7 +251,10 @@ func dispatchNormal(ctx context.Context, db *sqlite.DB, client *lark.Client,
 		return true
 	}
 
-	turnCount, _ := db.GetTurnCount(ctx, row.TaskID)
+	turnCount, tcErr := db.GetTurnCount(ctx, row.TaskID)
+	if tcErr != nil {
+		log.Printf("dispatchNormal: GetTurnCount %s: %v", row.TaskID, tcErr)
+	}
 	if turnCount+1 >= maxTurns {
 		if phaseErr := db.UpdateInboxPhase(ctx, row.CommentID, "compact", row.Content); phaseErr != nil {
 			log.Printf("dispatchNormal: UpdateInboxPhase %s: %v", row.CommentID, phaseErr)
