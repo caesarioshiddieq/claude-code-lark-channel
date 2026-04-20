@@ -26,7 +26,7 @@ func nextGCTime() time.Time {
 	now := time.Now()
 	t := time.Date(now.Year(), now.Month(), now.Day(), 3, 0, 0, 0, now.Location())
 	if !t.After(now) {
-		t = t.Add(24 * time.Hour)
+		t = t.AddDate(0, 0, 1)
 	}
 	return t
 }

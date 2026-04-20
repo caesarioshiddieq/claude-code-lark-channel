@@ -32,14 +32,15 @@ func RunWatchdog(ctx context.Context, checker StuckRowChecker) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				threshold := time.Now().Add(-watchdogTimeout()).UnixMilli()
+				timeout := watchdogTimeout()
+				threshold := time.Now().Add(-timeout).UnixMilli()
 				ids, err := checker.ListStuckCompactRows(ctx, threshold)
 				if err != nil {
 					log.Printf("watchdog: query error: %v", err)
 					continue
 				}
 				for _, id := range ids {
-					log.Printf("ALERT: inbox %s stuck in phase=compact >%v", id, watchdogTimeout())
+					log.Printf("ALERT: inbox %s stuck in phase=compact >%v", id, timeout)
 				}
 			}
 		}
