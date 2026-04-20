@@ -11,6 +11,76 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+const createMigrations = `
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version    INTEGER PRIMARY KEY,
+  applied_at INTEGER NOT NULL
+);`
+
+var migration0002 = []string{
+	`ALTER TABLE inbox ADD COLUMN source TEXT NOT NULL DEFAULT 'human'`,
+	`ALTER TABLE inbox ADD COLUMN scheduled_for INTEGER`,
+	`ALTER TABLE inbox ADD COLUMN defer_count INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE inbox ADD COLUMN phase TEXT NOT NULL DEFAULT 'normal'`,
+	`ALTER TABLE inbox ADD COLUMN original_content TEXT`,
+	`ALTER TABLE outbox ADD COLUMN phase TEXT NOT NULL DEFAULT 'normal'`,
+	`ALTER TABLE outbox ADD COLUMN comment_id TEXT NOT NULL DEFAULT ''`,
+	`UPDATE outbox SET comment_id = reply_to_comment_id WHERE comment_id = ''`,
+	`CREATE UNIQUE INDEX IF NOT EXISTS outbox_event_uniq ON outbox (comment_id, phase)`,
+	`CREATE TABLE IF NOT EXISTS turn_usage (
+        spawn_id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        comment_id            TEXT    NOT NULL,
+        task_id               TEXT    NOT NULL,
+        session_uuid          TEXT    NOT NULL,
+        phase                 TEXT    NOT NULL,
+        input_tokens          INTEGER NOT NULL DEFAULT 0,
+        output_tokens         INTEGER NOT NULL DEFAULT 0,
+        cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
+        cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+        is_rate_limit_error   INTEGER NOT NULL DEFAULT 0,
+        created_at            INTEGER NOT NULL
+    )`,
+	`CREATE INDEX IF NOT EXISTS turn_usage_created_at_idx ON turn_usage(created_at)`,
+	`CREATE INDEX IF NOT EXISTS inbox_scheduled_idx ON inbox(scheduled_for) WHERE scheduled_for IS NOT NULL`,
+}
+
+func migrate(db *sql.DB) error {
+	if _, err := db.Exec(createMigrations); err != nil {
+		return fmt.Errorf("create migrations table: %w", err)
+	}
+	migrations := []struct {
+		version int
+		stmts   []string
+	}{
+		{2, migration0002},
+	}
+	for _, m := range migrations {
+		var count int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM schema_migrations WHERE version = ?`,
+			m.version).Scan(&count); err != nil {
+			return fmt.Errorf("check migration %d: %w", m.version, err)
+		}
+		if count > 0 {
+			continue
+		}
+		for _, stmt := range m.stmts {
+			if _, err := db.Exec(stmt); err != nil {
+				preview := stmt
+				if len(preview) > 40 {
+					preview = preview[:40]
+				}
+				return fmt.Errorf("migration %d stmt %q: %w", m.version, preview, err)
+			}
+		}
+		if _, err := db.Exec(
+			`INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)`,
+			m.version, time.Now().UnixMilli()); err != nil {
+			return fmt.Errorf("record migration %d: %w", m.version, err)
+		}
+	}
+	return nil
+}
+
 const schema = `
 CREATE TABLE IF NOT EXISTS sessions (
   task_id TEXT PRIMARY KEY,
@@ -72,7 +142,12 @@ func Open(path string) (*DB, error) {
 		db.Close()
 		return nil, fmt.Errorf("sqlite schema: %w", err)
 	}
-	return &DB{db: db}, nil
+	d := &DB{db: db}
+	if err := migrate(db); err != nil {
+		d.Close()
+		return nil, fmt.Errorf("schema migration: %w", err)
+	}
+	return d, nil
 }
 
 func (d *DB) Close() error { return d.db.Close() }

@@ -2,6 +2,7 @@ package sqlite_test
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -118,4 +119,44 @@ func TestOutbox_InsertCheckMarkPosted(t *testing.T) {
 	if !found || larkID != "new-c99" {
 		t.Fatalf("want new-c99, got %s found=%v", larkID, found)
 	}
+}
+
+func TestMigration0002_NewColumns(t *testing.T) {
+	db := openTestDB(t)
+
+	for _, col := range []string{"source", "scheduled_for", "defer_count", "phase", "original_content"} {
+		var name string
+		if err := db.RawDB().QueryRow(
+			`SELECT name FROM pragma_table_info('inbox') WHERE name = ?`, col,
+		).Scan(&name); err != nil {
+			t.Errorf("inbox column %q missing: %v", col, err)
+		}
+	}
+	for _, col := range []string{"phase", "comment_id"} {
+		var name string
+		if err := db.RawDB().QueryRow(
+			`SELECT name FROM pragma_table_info('outbox') WHERE name = ?`, col,
+		).Scan(&name); err != nil {
+			t.Errorf("outbox column %q missing: %v", col, err)
+		}
+	}
+	var tableName string
+	if err := db.RawDB().QueryRow(
+		`SELECT name FROM sqlite_master WHERE type='table' AND name='turn_usage'`,
+	).Scan(&tableName); err != nil {
+		t.Errorf("turn_usage table missing: %v", err)
+	}
+
+	// Idempotency: re-open same DB must not error
+	path := filepath.Join(t.TempDir(), "rerun.db")
+	db1, err := q.Open(path)
+	if err != nil {
+		t.Fatalf("first Open: %v", err)
+	}
+	db1.Close()
+	db2, err := q.Open(path)
+	if err != nil {
+		t.Fatalf("second Open (idempotency): %v", err)
+	}
+	db2.Close()
 }
