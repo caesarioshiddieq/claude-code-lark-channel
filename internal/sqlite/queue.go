@@ -7,9 +7,13 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/caesarioshiddieq/claude-code-lark-channel/internal/budget"
 	"github.com/caesarioshiddieq/claude-code-lark-channel/internal/lark"
 	_ "modernc.org/sqlite"
 )
+
+// compile-time check: *DB must implement budget.Queuer
+var _ budget.Queuer = (*DB)(nil)
 
 const createMigrations = `
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -128,10 +132,13 @@ CREATE TABLE IF NOT EXISTS dlq (
 `
 
 type InboxRow struct {
-	CommentID string
-	TaskID    string
-	Content   string
-	CreatorID string
+	CommentID       string
+	TaskID          string
+	Content         string
+	CreatorID       string
+	Source          string // 'human' or 'autonomous'
+	Phase           string // 'normal', 'compact', 'answer'
+	OriginalContent string // empty string if NULL
 }
 
 type DB struct{ db *sql.DB }
@@ -174,18 +181,32 @@ func (d *DB) InsertInbox(ctx context.Context, taskID string, c lark.Comment) err
 }
 
 func (d *DB) NextInboxRow(ctx context.Context) (InboxRow, bool, error) {
-	var row InboxRow
-	err := d.db.QueryRowContext(ctx,
-		`SELECT comment_id, task_id, content, creator_id FROM inbox
-		 WHERE processed_at IS NULL ORDER BY created_at ASC LIMIT 1`,
-	).Scan(&row.CommentID, &row.TaskID, &row.Content, &row.CreatorID)
+	const q = `
+		SELECT comment_id, task_id, content, creator_id,
+		       COALESCE(source,'human'), COALESCE(phase,'normal'),
+		       COALESCE(original_content,'')
+		FROM inbox
+		WHERE processed_at IS NULL
+		  AND (scheduled_for IS NULL OR scheduled_for <= ?)
+		ORDER BY
+		  CASE phase
+		    WHEN 'answer'  THEN 1
+		    WHEN 'compact' THEN 2
+		    ELSE               3
+		  END,
+		  created_at ASC
+		LIMIT 1`
+	var r InboxRow
+	err := d.db.QueryRowContext(ctx, q, time.Now().UnixMilli()).Scan(
+		&r.CommentID, &r.TaskID, &r.Content, &r.CreatorID,
+		&r.Source, &r.Phase, &r.OriginalContent)
 	if errors.Is(err, sql.ErrNoRows) {
 		return InboxRow{}, false, nil
 	}
 	if err != nil {
 		return InboxRow{}, false, err
 	}
-	return row, true, nil
+	return r, true, nil
 }
 
 func (d *DB) MarkInboxProcessed(ctx context.Context, commentID string) error {
@@ -195,6 +216,179 @@ func (d *DB) MarkInboxProcessed(ctx context.Context, commentID string) error {
 		return fmt.Errorf("mark inbox processed: %w", err)
 	}
 	return nil
+}
+
+// InsertHumanInbox records a human-originated Lark comment. source='human' is set explicitly.
+func (d *DB) InsertHumanInbox(ctx context.Context, taskID string, c lark.Comment) error {
+	const q = `INSERT OR IGNORE INTO inbox
+		(comment_id, task_id, content, creator_id, created_at, source, phase)
+		VALUES (?, ?, ?, ?, ?, 'human', 'normal')`
+	_, err := d.db.ExecContext(ctx, q, c.CommentID, taskID, c.Content, c.Creator.ID, c.CreatedAt)
+	return err
+}
+
+// InsertAutonomousInbox records an autonomous task. source='autonomous' is set explicitly.
+func (d *DB) InsertAutonomousInbox(ctx context.Context, taskID, commentID, content string) error {
+	const q = `INSERT OR IGNORE INTO inbox
+		(comment_id, task_id, content, creator_id, created_at, source, phase)
+		VALUES (?, ?, ?, 'autonomous', ?, 'autonomous', 'normal')`
+	_, err := d.db.ExecContext(ctx, q, commentID, taskID, content, time.Now().UnixMilli())
+	return err
+}
+
+// UpdateInboxPhase transitions an inbox row's phase and snapshots original_content if non-empty.
+func (d *DB) UpdateInboxPhase(ctx context.Context, commentID, newPhase, originalContent string) error {
+	var oc interface{}
+	if originalContent != "" {
+		oc = originalContent
+	}
+	_, err := d.db.ExecContext(ctx,
+		`UPDATE inbox SET phase = ?, original_content = ? WHERE comment_id = ?`,
+		newPhase, oc, commentID)
+	return err
+}
+
+// ResetInboxPhase resets a row to phase='normal' and clears original_content.
+// Used when a compact spawn fails.
+func (d *DB) ResetInboxPhase(ctx context.Context, commentID string) error {
+	_, err := d.db.ExecContext(ctx,
+		`UPDATE inbox SET phase = 'normal', original_content = NULL WHERE comment_id = ?`,
+		commentID)
+	return err
+}
+
+func (d *DB) MarkDeferred(ctx context.Context, commentID string, scheduledFor int64, originalContent string) error {
+	var oc interface{}
+	if originalContent != "" {
+		oc = originalContent
+	}
+	_, err := d.db.ExecContext(ctx,
+		`UPDATE inbox SET scheduled_for = ?, original_content = ? WHERE comment_id = ?`,
+		scheduledFor, oc, commentID)
+	return err
+}
+
+func (d *DB) MarkReadyNow(ctx context.Context, commentID string) error {
+	_, err := d.db.ExecContext(ctx,
+		`UPDATE inbox SET scheduled_for = NULL WHERE comment_id = ?`, commentID)
+	return err
+}
+
+func (d *DB) RescheduleDeferred(ctx context.Context, commentID string, scheduledFor int64) error {
+	_, err := d.db.ExecContext(ctx,
+		`UPDATE inbox SET scheduled_for = ? WHERE comment_id = ?`, scheduledFor, commentID)
+	return err
+}
+
+func (d *DB) BumpDeferCount(ctx context.Context, commentID string) error {
+	_, err := d.db.ExecContext(ctx,
+		`UPDATE inbox SET defer_count = defer_count + 1 WHERE comment_id = ?`, commentID)
+	return err
+}
+
+func (d *DB) ListStaleDeferrals(ctx context.Context) ([]budget.DeferredRow, error) {
+	rows, err := d.db.QueryContext(ctx,
+		`SELECT comment_id, task_id, defer_count FROM inbox
+		 WHERE scheduled_for IS NOT NULL AND scheduled_for < ? AND processed_at IS NULL`,
+		time.Now().UnixMilli())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []budget.DeferredRow
+	for rows.Next() {
+		var r budget.DeferredRow
+		if err := rows.Scan(&r.CommentID, &r.TaskID, &r.DeferCount); err != nil {
+			return nil, err
+		}
+		result = append(result, r)
+	}
+	return result, rows.Err()
+}
+
+// MoveToDLQ marks a row as processed with a DLQ note, removing it from active polling.
+// Since there is no separate DLQ table, processed_at is set so NextInboxRow skips it.
+func (d *DB) MoveToDLQ(ctx context.Context, commentID, taskID, reason string) error {
+	_, err := d.db.ExecContext(ctx,
+		`UPDATE inbox SET processed_at = ? WHERE comment_id = ?`,
+		time.Now().UnixMilli(), commentID)
+	return err
+}
+
+// OutboxInsertPhased records an outbox entry keyed by (comment_id, phase).
+func (d *DB) OutboxInsertPhased(ctx context.Context, commentID, taskID, replyToCommentID, phase string) error {
+	hash := commentID + ":" + phase
+	_, err := d.db.ExecContext(ctx,
+		`INSERT OR IGNORE INTO outbox
+		 (content_hash, task_id, reply_to_comment_id, comment_id, phase, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		hash, taskID, replyToCommentID, commentID, phase, time.Now().UnixMilli())
+	return err
+}
+
+// TurnUsage holds per-spawn telemetry inserted after every Claude invocation.
+type TurnUsage struct {
+	CommentID           string
+	TaskID              string
+	SessionUUID         string
+	Phase               string
+	InputTokens         int
+	OutputTokens        int
+	CacheReadTokens     int
+	CacheCreationTokens int
+	IsRateLimitError    bool
+}
+
+func (d *DB) InsertTurnUsage(ctx context.Context, u TurnUsage) error {
+	rl := 0
+	if u.IsRateLimitError {
+		rl = 1
+	}
+	_, err := d.db.ExecContext(ctx,
+		`INSERT INTO turn_usage
+		 (comment_id, task_id, session_uuid, phase,
+		  input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
+		  is_rate_limit_error, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		u.CommentID, u.TaskID, u.SessionUUID, u.Phase,
+		u.InputTokens, u.OutputTokens, u.CacheReadTokens, u.CacheCreationTokens,
+		rl, time.Now().UnixMilli())
+	return err
+}
+
+func (d *DB) DeleteOldTurnUsage(ctx context.Context, olderThanMs int64) (int64, error) {
+	res, err := d.db.ExecContext(ctx,
+		`DELETE FROM turn_usage WHERE created_at < ?`, olderThanMs)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+func (d *DB) ListStuckCompactRows(ctx context.Context, olderThanMs int64) ([]string, error) {
+	rows, err := d.db.QueryContext(ctx,
+		`SELECT comment_id FROM inbox WHERE phase = 'compact' AND processed_at IS NULL AND created_at < ?`,
+		olderThanMs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// ResetTurnCount sets sessions.turn_count = 0 after a successful answer phase.
+func (d *DB) ResetTurnCount(ctx context.Context, taskID string) error {
+	_, err := d.db.ExecContext(ctx,
+		`UPDATE sessions SET turn_count = 0 WHERE task_id = ?`, taskID)
+	return err
 }
 
 func (d *DB) MoveToDeadLetter(ctx context.Context, commentID, taskID, lastError string) error {

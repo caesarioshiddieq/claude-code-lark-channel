@@ -204,6 +204,78 @@ func TestMigration0002_NewColumns(t *testing.T) {
 	db2.Close()
 }
 
+func TestInsertHumanInbox_SetsSource(t *testing.T) {
+	db := openTestDB(t)
+	c := lark.Comment{CommentID: "C1", Content: "hello", Creator: lark.Creator{ID: "U1"}, CreatedAt: 1}
+	if err := db.InsertHumanInbox(context.Background(), "T1", c); err != nil {
+		t.Fatalf("InsertHumanInbox: %v", err)
+	}
+	var src, phase string
+	db.RawDB().QueryRow(`SELECT source, phase FROM inbox WHERE comment_id='C1'`).Scan(&src, &phase)
+	if src != "human" {
+		t.Errorf("source=%q, want human", src)
+	}
+	if phase != "normal" {
+		t.Errorf("phase=%q, want normal", phase)
+	}
+}
+
+func TestNextInboxRow_AnswerBeforeNormal(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	db.RawDB().Exec(`INSERT INTO inbox (comment_id,task_id,content,creator_id,created_at,source,phase)
+		VALUES ('C1','T1','hello','U1',1,'human','normal')`)
+	db.RawDB().Exec(`INSERT INTO inbox (comment_id,task_id,content,creator_id,created_at,source,phase)
+		VALUES ('C2','T1','world','U1',2,'human','answer')`)
+	row, ok, err := db.NextInboxRow(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected a row")
+	}
+	if row.CommentID != "C2" {
+		t.Errorf("want answer row C2, got %s (phase=%s)", row.CommentID, row.Phase)
+	}
+}
+
+func TestNextInboxRow_SkipsScheduledFuture(t *testing.T) {
+	db := openTestDB(t)
+	future := time.Now().Add(24 * time.Hour).UnixMilli()
+	db.RawDB().Exec(`INSERT INTO inbox (comment_id,task_id,content,creator_id,created_at,source,phase,scheduled_for)
+		VALUES ('C3','T1','hi','U1',1,'autonomous','normal',?)`, future)
+	_, ok, err := db.NextInboxRow(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Error("should not return future-scheduled row")
+	}
+}
+
+func TestInsertTurnUsage_And_Delete(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	u := q.TurnUsage{CommentID: "C1", TaskID: "T1", SessionUUID: "S1", Phase: "normal", InputTokens: 100}
+	if err := db.InsertTurnUsage(ctx, u); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	db.RawDB().QueryRow(`SELECT COUNT(*) FROM turn_usage WHERE comment_id='C1'`).Scan(&count)
+	if count != 1 {
+		t.Errorf("expected 1 row, got %d", count)
+	}
+
+	// Old row should be deleted (created just now, cutoff = now+1s means it's "old")
+	n, err := db.DeleteOldTurnUsage(ctx, time.Now().Add(time.Second).UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("expected 1 deleted, got %d", n)
+	}
+}
+
 func TestMigration0002_BackfillUpdatesExistingRows(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "backfill_real.db")
 
