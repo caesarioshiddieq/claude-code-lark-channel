@@ -25,10 +25,10 @@ var migration0002 = []string{
 	`ALTER TABLE inbox ADD COLUMN original_content TEXT`,
 	`ALTER TABLE outbox ADD COLUMN phase TEXT NOT NULL DEFAULT 'normal'`,
 	`ALTER TABLE outbox ADD COLUMN comment_id TEXT NOT NULL DEFAULT ''`,
-	`UPDATE outbox SET comment_id = reply_to_comment_id WHERE comment_id = ''`,
+	`UPDATE outbox SET comment_id = COALESCE(reply_to_comment_id, '') WHERE comment_id = ''`,
 	`CREATE UNIQUE INDEX IF NOT EXISTS outbox_event_uniq ON outbox (comment_id, phase)`,
 	`CREATE TABLE IF NOT EXISTS turn_usage (
-        spawn_id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        spawn_id              INTEGER PRIMARY KEY,
         comment_id            TEXT    NOT NULL,
         task_id               TEXT    NOT NULL,
         session_uuid          TEXT    NOT NULL,
@@ -63,19 +63,28 @@ func migrate(db *sql.DB) error {
 		if count > 0 {
 			continue
 		}
+		tx, err := db.Begin()
+		if err != nil {
+			return fmt.Errorf("begin migration %d: %w", m.version, err)
+		}
 		for _, stmt := range m.stmts {
-			if _, err := db.Exec(stmt); err != nil {
+			if _, err := tx.Exec(stmt); err != nil {
 				preview := stmt
 				if len(preview) > 40 {
 					preview = preview[:40]
 				}
+				_ = tx.Rollback()
 				return fmt.Errorf("migration %d stmt %q: %w", m.version, preview, err)
 			}
 		}
-		if _, err := db.Exec(
+		if _, err := tx.Exec(
 			`INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)`,
 			m.version, time.Now().UnixMilli()); err != nil {
+			_ = tx.Rollback()
 			return fmt.Errorf("record migration %d: %w", m.version, err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit migration %d: %w", m.version, err)
 		}
 	}
 	return nil

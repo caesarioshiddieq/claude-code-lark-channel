@@ -121,6 +121,47 @@ func TestOutbox_InsertCheckMarkPosted(t *testing.T) {
 	}
 }
 
+func TestMigration0002_OutboxBackfill(t *testing.T) {
+	db := openTestDB(t)
+
+	// Insert an outbox row with a non-empty reply_to_comment_id to verify the
+	// unique index (comment_id, phase) works correctly after the COALESCE backfill.
+	_, err := db.RawDB().Exec(
+		`INSERT INTO outbox (content_hash, task_id, reply_to_comment_id, created_at, phase, comment_id)
+		 VALUES ('hash1', 'task-1', 'cmt-abc', 1, 'normal', 'cmt-abc')`)
+	if err != nil {
+		t.Fatalf("insert outbox row: %v", err)
+	}
+
+	// A second row with the same (comment_id, phase) must violate the unique index.
+	_, err = db.RawDB().Exec(
+		`INSERT INTO outbox (content_hash, task_id, reply_to_comment_id, created_at, phase, comment_id)
+		 VALUES ('hash2', 'task-1', 'cmt-abc', 2, 'normal', 'cmt-abc')`)
+	if err == nil {
+		t.Error("expected UNIQUE constraint violation on (comment_id, phase), got nil")
+	}
+
+	// A row with NULL reply_to_comment_id must get comment_id = '' (COALESCE result)
+	// after backfill; verify we can insert it without NOT NULL violation.
+	_, err = db.RawDB().Exec(
+		`INSERT INTO outbox (content_hash, task_id, reply_to_comment_id, created_at, phase, comment_id)
+		 VALUES ('hash3', 'task-1', NULL, 3, 'normal', '')`)
+	if err != nil {
+		t.Fatalf("insert outbox row with NULL reply_to_comment_id: %v", err)
+	}
+
+	// Verify the row's comment_id is empty string (what COALESCE(NULL, '') would produce).
+	var commentID string
+	if err := db.RawDB().QueryRow(
+		`SELECT comment_id FROM outbox WHERE content_hash = 'hash3'`,
+	).Scan(&commentID); err != nil {
+		t.Fatalf("query hash3: %v", err)
+	}
+	if commentID != "" {
+		t.Errorf("expected comment_id='', got %q", commentID)
+	}
+}
+
 func TestMigration0002_NewColumns(t *testing.T) {
 	db := openTestDB(t)
 
