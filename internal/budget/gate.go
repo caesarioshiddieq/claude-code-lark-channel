@@ -1,6 +1,7 @@
 package budget
 
 import (
+	"context"
 	"crypto/rand"
 	"math/big"
 	"os"
@@ -8,7 +9,11 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	_ "time/tzdata"
 )
+
+// execCommand is a package-level var for dependency injection in tests.
+var execCommand = exec.CommandContext
 
 var jakarta *time.Location
 
@@ -86,26 +91,29 @@ func JitteredNightStart(now time.Time, jitterMin int) time.Time {
 }
 
 // ClockHealthy reports NTP sync via timedatectl → chronyc → fail-open.
-func ClockHealthy() bool {
-	if ok, avail := tryTimedatectl(); avail {
+// Each tool is given a 3-second timeout.
+func ClockHealthy(ctx context.Context) bool {
+	ctx3, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	if ok, avail := tryTimedatectl(ctx3); avail {
 		return ok
 	}
-	if ok, avail := tryChronyc(); avail {
+	if ok, avail := tryChronyc(ctx3); avail {
 		return ok
 	}
 	return true // no sync tool available — fail open
 }
 
-func tryTimedatectl() (synced, available bool) {
-	out, err := exec.Command("timedatectl", "status").Output()
+func tryTimedatectl(ctx context.Context) (synced, available bool) {
+	out, err := execCommand(ctx, "timedatectl", "status").Output()
 	if err != nil {
 		return false, false
 	}
 	return strings.Contains(string(out), "synchronized: yes"), true
 }
 
-func tryChronyc() (synced, available bool) {
-	out, err := exec.Command("chronyc", "tracking").Output()
+func tryChronyc(ctx context.Context) (synced, available bool) {
+	out, err := execCommand(ctx, "chronyc", "tracking").Output()
 	if err != nil {
 		return false, false
 	}
@@ -113,14 +121,14 @@ func tryChronyc() (synced, available bool) {
 }
 
 // CanSpawn returns (true,"") or (false,reason). Human spawns are never gated.
-func CanSpawn(source string, now time.Time) (bool, string) {
+func CanSpawn(ctx context.Context, source string, now time.Time) (bool, string) {
 	if source != "autonomous" {
 		return true, ""
 	}
 	if !IsNightWindow(now) {
 		return false, "autonomous spawns blocked during day window (05:00–19:00 WIB)"
 	}
-	if !ClockHealthy() {
+	if !ClockHealthy(ctx) {
 		return false, "clock health check failed: NTP unsynchronized"
 	}
 	return true, ""

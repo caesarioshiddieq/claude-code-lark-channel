@@ -1,7 +1,9 @@
 package budget_test
 
 import (
+	"context"
 	"os"
+	"os/exec"
 	"testing"
 	"time"
 
@@ -84,7 +86,7 @@ func TestCanSpawn_Human_AlwaysAllowed(t *testing.T) {
 	os.Unsetenv("NIGHT_START")
 	os.Unsetenv("NIGHT_END")
 	os.Unsetenv("TZ")
-	ok, reason := budget.CanSpawn("human", jakartaTime(2026, 4, 20, 10, 0, 0))
+	ok, reason := budget.CanSpawn(context.Background(), "human", jakartaTime(2026, 4, 20, 10, 0, 0))
 	if !ok {
 		t.Errorf("human spawn should be allowed, got: %s", reason)
 	}
@@ -94,11 +96,78 @@ func TestCanSpawn_Autonomous_BlockedDuringDay(t *testing.T) {
 	os.Unsetenv("NIGHT_START")
 	os.Unsetenv("NIGHT_END")
 	os.Unsetenv("TZ")
-	ok, reason := budget.CanSpawn("autonomous", jakartaTime(2026, 4, 20, 10, 0, 0))
+	ok, reason := budget.CanSpawn(context.Background(), "autonomous", jakartaTime(2026, 4, 20, 10, 0, 0))
 	if ok {
 		t.Error("autonomous spawn should be blocked during day window")
 	}
 	if reason == "" {
 		t.Error("expected non-empty reason")
+	}
+}
+
+func TestClockHealthy_TimedatectlSynced(t *testing.T) {
+	restore := budget.SetExecCommand(func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		if name == "timedatectl" {
+			return exec.Command("echo", "NTP synchronized: yes")
+		}
+		return exec.Command("false")
+	})
+	defer restore()
+	if !budget.ClockHealthy(context.Background()) {
+		t.Error("expected ClockHealthy=true when timedatectl reports synced")
+	}
+}
+
+func TestClockHealthy_Fallback_Chronyc(t *testing.T) {
+	restore := budget.SetExecCommand(func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		if name == "timedatectl" {
+			return exec.Command("false") // unavailable
+		}
+		if name == "chronyc" {
+			return exec.Command("echo", "System time : 0.000001234 seconds fast of NTP")
+		}
+		return exec.Command("false")
+	})
+	defer restore()
+	if !budget.ClockHealthy(context.Background()) {
+		t.Error("expected ClockHealthy=true when chronyc reports synced")
+	}
+}
+
+func TestClockHealthy_FailOpen(t *testing.T) {
+	restore := budget.SetExecCommand(func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		return exec.Command("false") // all tools unavailable
+	})
+	defer restore()
+	if !budget.ClockHealthy(context.Background()) {
+		t.Error("expected ClockHealthy=true (fail-open) when no tools available")
+	}
+}
+
+func TestIsNightWindow_EnvOverride(t *testing.T) {
+	t.Setenv("NIGHT_START", "23")
+	t.Setenv("NIGHT_END", "3")
+	loc, _ := time.LoadLocation("Asia/Jakarta")
+	// 23:30 = night with custom window
+	if !budget.IsNightWindow(time.Date(2026, 4, 20, 23, 30, 0, 0, loc)) {
+		t.Error("23:30 should be night with NIGHT_START=23")
+	}
+	// 12:00 = day with custom window
+	if budget.IsNightWindow(time.Date(2026, 4, 20, 12, 0, 0, 0, loc)) {
+		t.Error("12:00 should be day with NIGHT_END=3")
+	}
+}
+
+func TestIsNightWindow_SameDay(t *testing.T) {
+	t.Setenv("NIGHT_START", "8")
+	t.Setenv("NIGHT_END", "20")
+	loc, _ := time.LoadLocation("Asia/Jakarta")
+	// 10:00 = inside same-day window
+	if !budget.IsNightWindow(time.Date(2026, 4, 20, 10, 0, 0, 0, loc)) {
+		t.Error("10:00 should be night with NIGHT_START=8 NIGHT_END=20 (same-day window)")
+	}
+	// 21:00 = outside same-day window
+	if budget.IsNightWindow(time.Date(2026, 4, 20, 21, 0, 0, 0, loc)) {
+		t.Error("21:00 should be day with same-day window ending at 20")
 	}
 }
