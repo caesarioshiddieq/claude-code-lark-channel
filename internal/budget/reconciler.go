@@ -2,6 +2,7 @@ package budget
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"strconv"
@@ -52,27 +53,43 @@ func ReconcileStaleDeferrals(ctx context.Context, q Queuer, now time.Time) error
 	}
 	dlqThreshold := deferCountDLQ()
 	jitter := nightJitterMinutes()
+	var failCount int
 
 	for _, row := range rows {
+		// S7: bail early if context is cancelled.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		if row.DeferCount >= dlqThreshold {
 			if err := q.MoveToDLQ(ctx, row.CommentID, row.TaskID, "max deferrals exceeded"); err != nil {
-				log.Printf("reconciler: DLQ move failed for %s: %v", row.CommentID, err)
+				log.Printf("reconciler: DLQ move failed for %s, falling back to reschedule: %v", row.CommentID, err)
+				failCount++
+				// fall through to reschedule path below
+			} else {
+				continue
 			}
-			continue
 		}
+
 		if IsNightWindow(now) {
 			if err := q.MarkReadyNow(ctx, row.CommentID); err != nil {
 				log.Printf("reconciler: mark-ready failed for %s: %v", row.CommentID, err)
+				failCount++
 			}
 		} else {
 			nextNight := JitteredNightStart(now, jitter)
 			if err := q.RescheduleDeferred(ctx, row.CommentID, nextNight.UnixMilli()); err != nil {
 				log.Printf("reconciler: reschedule failed for %s: %v", row.CommentID, err)
-			}
-			if err := q.BumpDeferCount(ctx, row.CommentID); err != nil {
+				failCount++
+			} else if err := q.BumpDeferCount(ctx, row.CommentID); err != nil {
 				log.Printf("reconciler: bump-defer failed for %s: %v", row.CommentID, err)
+				failCount++
 			}
 		}
+	}
+
+	if failCount > 0 {
+		return fmt.Errorf("reconciler: %d/%d rows had errors", failCount, len(rows))
 	}
 	return nil
 }
