@@ -226,6 +226,17 @@ func processOne(ctx context.Context, db *sqlite.DB, client *lark.Client, maxTurn
 func dispatchNormal(ctx context.Context, db *sqlite.DB, client *lark.Client,
 	row sqlite.InboxRow, sessionUUID string, isNew bool, maxTurns int) bool {
 
+	turnCount, tcErr := db.GetTurnCount(ctx, row.TaskID)
+	if tcErr != nil {
+		log.Printf("dispatchNormal: GetTurnCount %s: %v", row.TaskID, tcErr)
+	}
+	if turnCount+1 >= maxTurns {
+		if err := db.UpdateInboxPhase(ctx, row.CommentID, "compact", row.Content); err != nil {
+			log.Printf("dispatchNormal: UpdateInboxPhase(compact) %s: %v", row.CommentID, err)
+		}
+		return true
+	}
+
 	result, err := worker.SpawnClaudeWithUsage(ctx, sessionUUID, isNew, row.Content)
 	if usageErr := db.InsertTurnUsage(ctx, sqlite.TurnUsage{
 		CommentID: row.CommentID, TaskID: row.TaskID, SessionUUID: sessionUUID, Phase: "normal",
@@ -243,29 +254,22 @@ func dispatchNormal(ctx context.Context, db *sqlite.DB, client *lark.Client,
 		return true
 	}
 
-	if outboxErr := db.OutboxInsertPhased(ctx, row.CommentID, row.TaskID, row.CommentID, "normal"); outboxErr != nil {
+	inserted, outboxErr := db.OutboxInsertPhased(ctx, row.CommentID, row.TaskID, row.CommentID, "normal")
+	if outboxErr != nil {
 		log.Printf("dispatchNormal: OutboxInsertPhased %s: %v", row.CommentID, outboxErr)
 	}
-	if _, err := client.PostComment(ctx, row.TaskID, result.Reply, row.CommentID); err != nil {
-		log.Printf("dispatchNormal: PostComment %s: %v", row.CommentID, err)
-		return true
+	if inserted {
+		if _, err := client.PostComment(ctx, row.TaskID, result.Reply, row.CommentID); err != nil {
+			log.Printf("dispatchNormal: PostComment %s: %v", row.CommentID, err)
+			return true
+		}
 	}
 
-	turnCount, tcErr := db.GetTurnCount(ctx, row.TaskID)
-	if tcErr != nil {
-		log.Printf("dispatchNormal: GetTurnCount %s: %v", row.TaskID, tcErr)
+	if markErr := db.MarkInboxProcessed(ctx, row.CommentID); markErr != nil {
+		log.Printf("dispatchNormal: MarkInboxProcessed %s: %v", row.CommentID, markErr)
 	}
-	if turnCount+1 >= maxTurns {
-		if phaseErr := db.UpdateInboxPhase(ctx, row.CommentID, "compact", row.Content); phaseErr != nil {
-			log.Printf("dispatchNormal: UpdateInboxPhase %s: %v", row.CommentID, phaseErr)
-		}
-	} else {
-		if markErr := db.MarkInboxProcessed(ctx, row.CommentID); markErr != nil {
-			log.Printf("dispatchNormal: MarkInboxProcessed %s: %v", row.CommentID, markErr)
-		}
-		if incrErr := db.IncrTurnCount(ctx, row.TaskID); incrErr != nil {
-			log.Printf("dispatchNormal: IncrTurnCount %s: %v", row.TaskID, incrErr)
-		}
+	if incrErr := db.IncrTurnCount(ctx, row.TaskID); incrErr != nil {
+		log.Printf("dispatchNormal: IncrTurnCount %s: %v", row.TaskID, incrErr)
 	}
 	return true
 }
@@ -290,12 +294,15 @@ func dispatchCompact(ctx context.Context, db *sqlite.DB, client *lark.Client,
 		return true
 	}
 
-	if outboxErr := db.OutboxInsertPhased(ctx, row.CommentID, row.TaskID, row.CommentID, "compact"); outboxErr != nil {
+	insertedCompact, outboxErr := db.OutboxInsertPhased(ctx, row.CommentID, row.TaskID, row.CommentID, "compact")
+	if outboxErr != nil {
 		log.Printf("dispatchCompact: OutboxInsertPhased %s: %v", row.CommentID, outboxErr)
 	}
-	if _, err := client.PostComment(ctx, row.TaskID,
-		"Context summarized (turn cap reached).", row.CommentID); err != nil {
-		log.Printf("dispatchCompact: PostComment %s: %v", row.CommentID, err)
+	if insertedCompact {
+		if _, err := client.PostComment(ctx, row.TaskID,
+			"Context summarized (turn cap reached).", row.CommentID); err != nil {
+			log.Printf("dispatchCompact: PostComment %s: %v", row.CommentID, err)
+		}
 	}
 	if phaseErr := db.UpdateInboxPhase(ctx, row.CommentID, "answer", row.OriginalContent); phaseErr != nil {
 		log.Printf("dispatchCompact: UpdateInboxPhase %s: %v", row.CommentID, phaseErr)
@@ -323,12 +330,15 @@ func dispatchAnswer(ctx context.Context, db *sqlite.DB, client *lark.Client,
 		return true
 	}
 
-	if outboxErr := db.OutboxInsertPhased(ctx, row.CommentID, row.TaskID, row.CommentID, "answer"); outboxErr != nil {
+	insertedAnswer, outboxErr := db.OutboxInsertPhased(ctx, row.CommentID, row.TaskID, row.CommentID, "answer")
+	if outboxErr != nil {
 		log.Printf("dispatchAnswer: OutboxInsertPhased %s: %v", row.CommentID, outboxErr)
 	}
-	if _, err := client.PostComment(ctx, row.TaskID, result.Reply, row.CommentID); err != nil {
-		log.Printf("dispatchAnswer: PostComment %s: %v", row.CommentID, err)
-		return true
+	if insertedAnswer {
+		if _, err := client.PostComment(ctx, row.TaskID, result.Reply, row.CommentID); err != nil {
+			log.Printf("dispatchAnswer: PostComment %s: %v", row.CommentID, err)
+			return true
+		}
 	}
 
 	if resetErr := db.ResetTurnCount(ctx, row.TaskID); resetErr != nil {
