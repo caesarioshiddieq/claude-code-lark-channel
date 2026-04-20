@@ -2,12 +2,14 @@ package sqlite_test
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/caesarioshiddieq/claude-code-lark-channel/internal/lark"
 	q "github.com/caesarioshiddieq/claude-code-lark-channel/internal/sqlite"
+	_ "modernc.org/sqlite"
 )
 
 func openTestDB(t *testing.T) *q.DB {
@@ -200,4 +202,55 @@ func TestMigration0002_NewColumns(t *testing.T) {
 		t.Fatalf("second Open (idempotency): %v", err)
 	}
 	db2.Close()
+}
+
+func TestMigration0002_BackfillUpdatesExistingRows(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "backfill_real.db")
+
+	// Open raw SQLite without our Open() wrapper (no migration yet)
+	rawDB, err := sql.Open("sqlite", "file:"+path+"?_foreign_keys=on")
+	if err != nil {
+		t.Fatalf("raw open: %v", err)
+	}
+	defer rawDB.Close()
+
+	// Apply v1 schema only (no migration)
+	if _, err := rawDB.Exec(q.SchemaForTest); err != nil {
+		t.Fatalf("apply v1 schema: %v", err)
+	}
+
+	// Insert pre-migration outbox rows (no comment_id column yet in v1)
+	_, err = rawDB.Exec(`INSERT INTO outbox (content_hash, task_id, reply_to_comment_id, created_at)
+		VALUES ('hash-a', 'task-1', 'cmt-xyz', 1)`)
+	if err != nil {
+		t.Fatalf("insert row with reply_to_comment_id: %v", err)
+	}
+	_, err = rawDB.Exec(`INSERT INTO outbox (content_hash, task_id, reply_to_comment_id, created_at)
+		VALUES ('hash-b', 'task-1', NULL, 2)`)
+	if err != nil {
+		t.Fatalf("insert row with NULL reply_to_comment_id: %v", err)
+	}
+
+	// Run migration
+	if err := q.MigrateForTest(rawDB); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	// Verify backfill: reply_to_comment_id='cmt-xyz' → comment_id='cmt-xyz'
+	var commentID string
+	if err := rawDB.QueryRow(`SELECT comment_id FROM outbox WHERE reply_to_comment_id = 'cmt-xyz'`).Scan(&commentID); err != nil {
+		t.Fatalf("query after migration: %v", err)
+	}
+	if commentID != "cmt-xyz" {
+		t.Errorf("expected comment_id='cmt-xyz', got %q", commentID)
+	}
+
+	// Verify NULL case: reply_to_comment_id=NULL → comment_id=''
+	var commentIDNull string
+	if err := rawDB.QueryRow(`SELECT comment_id FROM outbox WHERE content_hash = 'hash-b'`).Scan(&commentIDNull); err != nil {
+		t.Fatalf("query null row after migration: %v", err)
+	}
+	if commentIDNull != "" {
+		t.Errorf("expected comment_id='' for NULL reply_to_comment_id, got %q", commentIDNull)
+	}
 }
