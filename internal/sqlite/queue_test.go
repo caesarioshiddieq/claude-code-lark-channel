@@ -280,11 +280,19 @@ func TestOutboxInsertPhased_Idempotency(t *testing.T) {
 	db := openTestDB(t)
 	ctx := context.Background()
 	// Insert same (comment_id, phase) twice — should not error, should have exactly 1 row
-	if err := db.OutboxInsertPhased(ctx, "C1", "T1", "reply-1", "compact"); err != nil {
+	inserted1, err := db.OutboxInsertPhased(ctx, "C1", "T1", "reply-1", "compact")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.OutboxInsertPhased(ctx, "C1", "T1", "reply-1", "compact"); err != nil {
+	if !inserted1 {
+		t.Error("first insert should return inserted=true")
+	}
+	inserted2, err := db.OutboxInsertPhased(ctx, "C1", "T1", "reply-1", "compact")
+	if err != nil {
 		t.Fatalf("second insert should be idempotent (INSERT OR IGNORE), got: %v", err)
+	}
+	if inserted2 {
+		t.Error("second insert should return inserted=false (duplicate)")
 	}
 	var count int
 	db.RawDB().QueryRow(`SELECT COUNT(*) FROM outbox WHERE comment_id='C1' AND phase='compact'`).Scan(&count)

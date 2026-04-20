@@ -356,17 +356,20 @@ func (d *DB) MoveToDLQ(ctx context.Context, commentID, taskID, reason string) er
 }
 
 // OutboxInsertPhased records an outbox entry keyed by (comment_id, phase).
-func (d *DB) OutboxInsertPhased(ctx context.Context, commentID, taskID, replyToCommentID, phase string) error {
+// Returns (true, nil) when a new row was inserted, (false, nil) when the row
+// already existed (INSERT OR IGNORE was a no-op), and (false, err) on error.
+func (d *DB) OutboxInsertPhased(ctx context.Context, commentID, taskID, replyToCommentID, phase string) (bool, error) {
 	hash := commentID + ":" + phase
-	_, err := d.db.ExecContext(ctx,
+	res, err := d.db.ExecContext(ctx,
 		`INSERT OR IGNORE INTO outbox
 		 (content_hash, task_id, reply_to_comment_id, comment_id, phase, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?)`,
 		hash, taskID, replyToCommentID, commentID, phase, time.Now().UnixMilli())
 	if err != nil {
-		return fmt.Errorf("outbox insert phased: %w", err)
+		return false, fmt.Errorf("outbox insert phased: %w", err)
 	}
-	return nil
+	n, _ := res.RowsAffected()
+	return n > 0, nil
 }
 
 // TurnUsage holds per-spawn telemetry inserted after every Claude invocation.
