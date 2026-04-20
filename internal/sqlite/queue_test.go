@@ -276,6 +276,83 @@ func TestInsertTurnUsage_And_Delete(t *testing.T) {
 	}
 }
 
+func TestOutboxInsertPhased_Idempotency(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	// Insert same (comment_id, phase) twice — should not error, should have exactly 1 row
+	if err := db.OutboxInsertPhased(ctx, "C1", "T1", "reply-1", "compact"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.OutboxInsertPhased(ctx, "C1", "T1", "reply-1", "compact"); err != nil {
+		t.Fatalf("second insert should be idempotent (INSERT OR IGNORE), got: %v", err)
+	}
+	var count int
+	db.RawDB().QueryRow(`SELECT COUNT(*) FROM outbox WHERE comment_id='C1' AND phase='compact'`).Scan(&count)
+	if count != 1 {
+		t.Errorf("expected 1 row, got %d", count)
+	}
+}
+
+func TestUpdateAndResetInboxPhase(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	db.RawDB().Exec(`INSERT INTO inbox (comment_id,task_id,content,creator_id,created_at,source,phase)
+		VALUES ('C1','T1','original content','U1',1,'human','normal')`)
+
+	// Transition to compact, snapshot original_content
+	if err := db.UpdateInboxPhase(ctx, "C1", "compact", "original content"); err != nil {
+		t.Fatal(err)
+	}
+	var phase, oc string
+	db.RawDB().QueryRow(`SELECT phase, COALESCE(original_content,'') FROM inbox WHERE comment_id='C1'`).Scan(&phase, &oc)
+	if phase != "compact" {
+		t.Errorf("phase=%q, want compact", phase)
+	}
+	if oc != "original content" {
+		t.Errorf("original_content=%q, want 'original content'", oc)
+	}
+
+	// Reset — phase='normal', original_content=NULL
+	if err := db.ResetInboxPhase(ctx, "C1"); err != nil {
+		t.Fatal(err)
+	}
+	db.RawDB().QueryRow(`SELECT phase, COALESCE(original_content,'') FROM inbox WHERE comment_id='C1'`).Scan(&phase, &oc)
+	if phase != "normal" {
+		t.Errorf("after reset: phase=%q, want normal", phase)
+	}
+	if oc != "" {
+		t.Errorf("after reset: original_content=%q, want empty", oc)
+	}
+}
+
+func TestListStaleDeferrals_Boundary(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	pastMs := time.Now().Add(-time.Hour).UnixMilli()
+	futureMs := time.Now().Add(time.Hour).UnixMilli()
+
+	// Past row (overdue) — should appear
+	db.RawDB().Exec(`INSERT INTO inbox (comment_id,task_id,content,creator_id,created_at,source,phase,scheduled_for)
+		VALUES ('C1','T1','hi','U1',1,'autonomous','normal',?)`, pastMs)
+	// Future row — should NOT appear
+	db.RawDB().Exec(`INSERT INTO inbox (comment_id,task_id,content,creator_id,created_at,source,phase,scheduled_for)
+		VALUES ('C2','T1','hi','U1',2,'autonomous','normal',?)`, futureMs)
+	// Already processed row — should NOT appear even if overdue
+	db.RawDB().Exec(`INSERT INTO inbox (comment_id,task_id,content,creator_id,created_at,source,phase,scheduled_for,processed_at)
+		VALUES ('C3','T1','hi','U1',3,'autonomous','normal',?,?)`, pastMs, pastMs)
+
+	rows, err := db.ListStaleDeferrals(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Errorf("expected 1 stale row, got %d", len(rows))
+	}
+	if len(rows) > 0 && rows[0].CommentID != "C1" {
+		t.Errorf("expected C1, got %s", rows[0].CommentID)
+	}
+}
+
 func TestMigration0002_BackfillUpdatesExistingRows(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "backfill_real.db")
 

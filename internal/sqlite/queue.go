@@ -204,14 +204,14 @@ func (d *DB) NextInboxRow(ctx context.Context) (InboxRow, bool, error) {
 		return InboxRow{}, false, nil
 	}
 	if err != nil {
-		return InboxRow{}, false, err
+		return InboxRow{}, false, fmt.Errorf("next inbox row: %w", err)
 	}
 	return r, true, nil
 }
 
 func (d *DB) MarkInboxProcessed(ctx context.Context, commentID string) error {
 	_, err := d.db.ExecContext(ctx, `UPDATE inbox SET processed_at = ? WHERE comment_id = ?`,
-		time.Now().Unix(), commentID)
+		time.Now().UnixMilli(), commentID)
 	if err != nil {
 		return fmt.Errorf("mark inbox processed: %w", err)
 	}
@@ -224,7 +224,10 @@ func (d *DB) InsertHumanInbox(ctx context.Context, taskID string, c lark.Comment
 		(comment_id, task_id, content, creator_id, created_at, source, phase)
 		VALUES (?, ?, ?, ?, ?, 'human', 'normal')`
 	_, err := d.db.ExecContext(ctx, q, c.CommentID, taskID, c.Content, c.Creator.ID, c.CreatedAt)
-	return err
+	if err != nil {
+		return fmt.Errorf("insert human inbox: %w", err)
+	}
+	return nil
 }
 
 // InsertAutonomousInbox records an autonomous task. source='autonomous' is set explicitly.
@@ -233,7 +236,10 @@ func (d *DB) InsertAutonomousInbox(ctx context.Context, taskID, commentID, conte
 		(comment_id, task_id, content, creator_id, created_at, source, phase)
 		VALUES (?, ?, ?, 'autonomous', ?, 'autonomous', 'normal')`
 	_, err := d.db.ExecContext(ctx, q, commentID, taskID, content, time.Now().UnixMilli())
-	return err
+	if err != nil {
+		return fmt.Errorf("insert autonomous inbox: %w", err)
+	}
+	return nil
 }
 
 // UpdateInboxPhase transitions an inbox row's phase and snapshots original_content if non-empty.
@@ -245,7 +251,10 @@ func (d *DB) UpdateInboxPhase(ctx context.Context, commentID, newPhase, original
 	_, err := d.db.ExecContext(ctx,
 		`UPDATE inbox SET phase = ?, original_content = ? WHERE comment_id = ?`,
 		newPhase, oc, commentID)
-	return err
+	if err != nil {
+		return fmt.Errorf("update inbox phase: %w", err)
+	}
+	return nil
 }
 
 // ResetInboxPhase resets a row to phase='normal' and clears original_content.
@@ -254,7 +263,10 @@ func (d *DB) ResetInboxPhase(ctx context.Context, commentID string) error {
 	_, err := d.db.ExecContext(ctx,
 		`UPDATE inbox SET phase = 'normal', original_content = NULL WHERE comment_id = ?`,
 		commentID)
-	return err
+	if err != nil {
+		return fmt.Errorf("reset inbox phase: %w", err)
+	}
+	return nil
 }
 
 func (d *DB) MarkDeferred(ctx context.Context, commentID string, scheduledFor int64, originalContent string) error {
@@ -265,25 +277,37 @@ func (d *DB) MarkDeferred(ctx context.Context, commentID string, scheduledFor in
 	_, err := d.db.ExecContext(ctx,
 		`UPDATE inbox SET scheduled_for = ?, original_content = ? WHERE comment_id = ?`,
 		scheduledFor, oc, commentID)
-	return err
+	if err != nil {
+		return fmt.Errorf("mark deferred: %w", err)
+	}
+	return nil
 }
 
 func (d *DB) MarkReadyNow(ctx context.Context, commentID string) error {
 	_, err := d.db.ExecContext(ctx,
 		`UPDATE inbox SET scheduled_for = NULL WHERE comment_id = ?`, commentID)
-	return err
+	if err != nil {
+		return fmt.Errorf("mark ready now: %w", err)
+	}
+	return nil
 }
 
 func (d *DB) RescheduleDeferred(ctx context.Context, commentID string, scheduledFor int64) error {
 	_, err := d.db.ExecContext(ctx,
 		`UPDATE inbox SET scheduled_for = ? WHERE comment_id = ?`, scheduledFor, commentID)
-	return err
+	if err != nil {
+		return fmt.Errorf("reschedule deferred: %w", err)
+	}
+	return nil
 }
 
 func (d *DB) BumpDeferCount(ctx context.Context, commentID string) error {
 	_, err := d.db.ExecContext(ctx,
 		`UPDATE inbox SET defer_count = defer_count + 1 WHERE comment_id = ?`, commentID)
-	return err
+	if err != nil {
+		return fmt.Errorf("bump defer count: %w", err)
+	}
+	return nil
 }
 
 func (d *DB) ListStaleDeferrals(ctx context.Context) ([]budget.DeferredRow, error) {
@@ -292,7 +316,7 @@ func (d *DB) ListStaleDeferrals(ctx context.Context) ([]budget.DeferredRow, erro
 		 WHERE scheduled_for IS NOT NULL AND scheduled_for < ? AND processed_at IS NULL`,
 		time.Now().UnixMilli())
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("list stale deferrals: %w", err)
 	}
 	defer rows.Close()
 	var result []budget.DeferredRow
@@ -306,13 +330,29 @@ func (d *DB) ListStaleDeferrals(ctx context.Context) ([]budget.DeferredRow, erro
 	return result, rows.Err()
 }
 
-// MoveToDLQ marks a row as processed with a DLQ note, removing it from active polling.
-// Since there is no separate DLQ table, processed_at is set so NextInboxRow skips it.
+// MoveToDLQ writes a forensic record to the dlq table and marks the inbox row
+// as processed so NextInboxRow skips it. Both writes are done in a transaction.
 func (d *DB) MoveToDLQ(ctx context.Context, commentID, taskID, reason string) error {
-	_, err := d.db.ExecContext(ctx,
+	tx, err := d.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("move to dlq begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	now := time.Now().UnixMilli()
+	if _, err := tx.ExecContext(ctx,
+		`INSERT OR REPLACE INTO dlq (comment_id, task_id, last_error, moved_at) VALUES (?,?,?,?)`,
+		commentID, taskID, reason, now); err != nil {
+		return fmt.Errorf("move to dlq insert: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
 		`UPDATE inbox SET processed_at = ? WHERE comment_id = ?`,
-		time.Now().UnixMilli(), commentID)
-	return err
+		now, commentID); err != nil {
+		return fmt.Errorf("move to dlq mark processed: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("move to dlq commit: %w", err)
+	}
+	return nil
 }
 
 // OutboxInsertPhased records an outbox entry keyed by (comment_id, phase).
@@ -323,7 +363,10 @@ func (d *DB) OutboxInsertPhased(ctx context.Context, commentID, taskID, replyToC
 		 (content_hash, task_id, reply_to_comment_id, comment_id, phase, created_at)
 		 VALUES (?, ?, ?, ?, ?, ?)`,
 		hash, taskID, replyToCommentID, commentID, phase, time.Now().UnixMilli())
-	return err
+	if err != nil {
+		return fmt.Errorf("outbox insert phased: %w", err)
+	}
+	return nil
 }
 
 // TurnUsage holds per-spawn telemetry inserted after every Claude invocation.
@@ -353,14 +396,17 @@ func (d *DB) InsertTurnUsage(ctx context.Context, u TurnUsage) error {
 		u.CommentID, u.TaskID, u.SessionUUID, u.Phase,
 		u.InputTokens, u.OutputTokens, u.CacheReadTokens, u.CacheCreationTokens,
 		rl, time.Now().UnixMilli())
-	return err
+	if err != nil {
+		return fmt.Errorf("insert turn usage: %w", err)
+	}
+	return nil
 }
 
 func (d *DB) DeleteOldTurnUsage(ctx context.Context, olderThanMs int64) (int64, error) {
 	res, err := d.db.ExecContext(ctx,
 		`DELETE FROM turn_usage WHERE created_at < ?`, olderThanMs)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("delete old turn usage: %w", err)
 	}
 	return res.RowsAffected()
 }
@@ -370,7 +416,7 @@ func (d *DB) ListStuckCompactRows(ctx context.Context, olderThanMs int64) ([]str
 		`SELECT comment_id FROM inbox WHERE phase = 'compact' AND processed_at IS NULL AND created_at < ?`,
 		olderThanMs)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("list stuck compact rows: %w", err)
 	}
 	defer rows.Close()
 	var ids []string
@@ -388,7 +434,10 @@ func (d *DB) ListStuckCompactRows(ctx context.Context, olderThanMs int64) ([]str
 func (d *DB) ResetTurnCount(ctx context.Context, taskID string) error {
 	_, err := d.db.ExecContext(ctx,
 		`UPDATE sessions SET turn_count = 0 WHERE task_id = ?`, taskID)
-	return err
+	if err != nil {
+		return fmt.Errorf("reset turn count: %w", err)
+	}
+	return nil
 }
 
 func (d *DB) MoveToDeadLetter(ctx context.Context, commentID, taskID, lastError string) error {
@@ -399,7 +448,7 @@ func (d *DB) MoveToDeadLetter(ctx context.Context, commentID, taskID, lastError 
 	defer func() { _ = tx.Rollback() }()
 	if _, err := tx.ExecContext(ctx,
 		`INSERT OR REPLACE INTO dlq (comment_id, task_id, last_error, moved_at) VALUES (?,?,?,?)`,
-		commentID, taskID, lastError, time.Now().Unix()); err != nil {
+		commentID, taskID, lastError, time.Now().UnixMilli()); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM inbox WHERE comment_id = ?`, commentID); err != nil {
@@ -421,7 +470,7 @@ func (d *DB) GetSession(ctx context.Context, taskID string) (string, bool, error
 }
 
 func (d *DB) UpsertSession(ctx context.Context, taskID, sessionUUID string) error {
-	now := time.Now().Unix()
+	now := time.Now().UnixMilli()
 	_, err := d.db.ExecContext(ctx,
 		`INSERT INTO sessions (task_id, session_uuid, created_at, last_active, turn_count)
 		 VALUES (?, ?, ?, ?, 0)
@@ -433,7 +482,7 @@ func (d *DB) UpsertSession(ctx context.Context, taskID, sessionUUID string) erro
 func (d *DB) IncrTurnCount(ctx context.Context, taskID string) error {
 	_, err := d.db.ExecContext(ctx,
 		`UPDATE sessions SET turn_count=turn_count+1, last_active=? WHERE task_id=?`,
-		time.Now().Unix(), taskID)
+		time.Now().UnixMilli(), taskID)
 	if err != nil {
 		return fmt.Errorf("incr turn count: %w", err)
 	}
@@ -485,7 +534,7 @@ func (d *DB) OutboxInsert(ctx context.Context, hash, taskID, replyToCommentID st
 	_, err := d.db.ExecContext(ctx,
 		`INSERT OR IGNORE INTO outbox (content_hash, task_id, reply_to_comment_id, created_at)
 		 VALUES (?,?,?,?)`,
-		hash, taskID, replyToCommentID, time.Now().Unix())
+		hash, taskID, replyToCommentID, time.Now().UnixMilli())
 	if err != nil {
 		return fmt.Errorf("outbox insert: %w", err)
 	}
@@ -495,7 +544,7 @@ func (d *DB) OutboxInsert(ctx context.Context, hash, taskID, replyToCommentID st
 func (d *DB) OutboxMarkPosted(ctx context.Context, hash, larkCommentID string) error {
 	_, err := d.db.ExecContext(ctx,
 		`UPDATE outbox SET lark_comment_id=?, posted_at=? WHERE content_hash=?`,
-		larkCommentID, time.Now().Unix(), hash)
+		larkCommentID, time.Now().UnixMilli(), hash)
 	if err != nil {
 		return fmt.Errorf("outbox mark posted: %w", err)
 	}
