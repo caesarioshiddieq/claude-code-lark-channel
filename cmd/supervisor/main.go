@@ -237,6 +237,17 @@ func dispatchNormal(ctx context.Context, db *sqlite.DB, client *lark.Client,
 		return true
 	}
 
+	// Crash-recovery guard: if a prior run already inserted the outbox entry but crashed before
+	// MarkInboxProcessed, skip re-spawning Claude to avoid burning tokens a second time.
+	if _, alreadyPosted, checkErr := db.OutboxCheck(ctx, row.CommentID+":normal"); checkErr != nil {
+		log.Printf("dispatchNormal: OutboxCheck %s: %v", row.CommentID, checkErr)
+	} else if alreadyPosted {
+		log.Printf("dispatchNormal: skipping re-spawn for %s (outbox entry exists from prior run)", row.CommentID)
+		_ = db.MarkInboxProcessed(ctx, row.CommentID)
+		_ = db.IncrTurnCount(ctx, row.TaskID)
+		return true
+	}
+
 	result, err := worker.SpawnClaudeWithUsage(ctx, sessionUUID, isNew, row.Content)
 	if usageErr := db.InsertTurnUsage(ctx, sqlite.TurnUsage{
 		CommentID: row.CommentID, TaskID: row.TaskID, SessionUUID: sessionUUID, Phase: "normal",

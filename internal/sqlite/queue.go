@@ -30,7 +30,6 @@ var migration0002 = []string{
 	`ALTER TABLE outbox ADD COLUMN phase TEXT NOT NULL DEFAULT 'normal'`,
 	`ALTER TABLE outbox ADD COLUMN comment_id TEXT NOT NULL DEFAULT ''`,
 	`UPDATE outbox SET comment_id = COALESCE(reply_to_comment_id, '') WHERE comment_id = ''`,
-	`CREATE UNIQUE INDEX IF NOT EXISTS outbox_event_uniq ON outbox (comment_id, phase)`,
 	`CREATE TABLE IF NOT EXISTS turn_usage (
         spawn_id              INTEGER PRIMARY KEY,
         comment_id            TEXT    NOT NULL,
@@ -48,6 +47,10 @@ var migration0002 = []string{
 	`CREATE INDEX IF NOT EXISTS inbox_scheduled_idx ON inbox(scheduled_for) WHERE scheduled_for IS NOT NULL`,
 }
 
+var migration0003 = []string{
+	`ALTER TABLE inbox ADD COLUMN compact_entered_at INTEGER`,
+}
+
 func migrate(db *sql.DB) error {
 	if _, err := db.Exec(createMigrations); err != nil {
 		return fmt.Errorf("create migrations table: %w", err)
@@ -57,6 +60,7 @@ func migrate(db *sql.DB) error {
 		stmts   []string
 	}{
 		{2, migration0002},
+		{3, migration0003},
 	}
 	for _, m := range migrations {
 		var count int
@@ -242,15 +246,22 @@ func (d *DB) InsertAutonomousInbox(ctx context.Context, taskID, commentID, conte
 	return nil
 }
 
-// UpdateInboxPhase transitions an inbox row's phase and snapshots original_content if non-empty.
+// UpdateInboxPhase transitions an inbox row's phase.
+// original_content is only written when non-empty; a blank string preserves the existing value.
+// compact_entered_at is set to now only when transitioning into 'compact'.
 func (d *DB) UpdateInboxPhase(ctx context.Context, commentID, newPhase, originalContent string) error {
 	var oc interface{}
 	if originalContent != "" {
 		oc = originalContent
 	}
+	now := time.Now().UnixMilli()
 	_, err := d.db.ExecContext(ctx,
-		`UPDATE inbox SET phase = ?, original_content = ? WHERE comment_id = ?`,
-		newPhase, oc, commentID)
+		`UPDATE inbox
+		 SET phase              = ?,
+		     original_content   = COALESCE(?, original_content),
+		     compact_entered_at = CASE WHEN ? = 'compact' THEN ? ELSE compact_entered_at END
+		 WHERE comment_id = ?`,
+		newPhase, oc, newPhase, now, commentID)
 	if err != nil {
 		return fmt.Errorf("update inbox phase: %w", err)
 	}
@@ -416,7 +427,11 @@ func (d *DB) DeleteOldTurnUsage(ctx context.Context, olderThanMs int64) (int64, 
 
 func (d *DB) ListStuckCompactRows(ctx context.Context, olderThanMs int64) ([]string, error) {
 	rows, err := d.db.QueryContext(ctx,
-		`SELECT comment_id FROM inbox WHERE phase = 'compact' AND processed_at IS NULL AND created_at < ?`,
+		`SELECT comment_id FROM inbox
+		 WHERE phase = 'compact'
+		   AND processed_at IS NULL
+		   AND compact_entered_at IS NOT NULL
+		   AND compact_entered_at < ?`,
 		olderThanMs)
 	if err != nil {
 		return nil, fmt.Errorf("list stuck compact rows: %w", err)

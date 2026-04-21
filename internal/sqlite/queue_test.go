@@ -126,33 +126,36 @@ func TestOutbox_InsertCheckMarkPosted(t *testing.T) {
 func TestMigration0002_OutboxBackfill(t *testing.T) {
 	db := openTestDB(t)
 
-	// Insert an outbox row with a non-empty reply_to_comment_id to verify the
-	// unique index (comment_id, phase) works correctly after the COALESCE backfill.
+	// content_hash is the PRIMARY KEY — inserting the same hash twice must fail.
 	_, err := db.RawDB().Exec(
 		`INSERT INTO outbox (content_hash, task_id, reply_to_comment_id, created_at, phase, comment_id)
 		 VALUES ('hash1', 'task-1', 'cmt-abc', 1, 'normal', 'cmt-abc')`)
 	if err != nil {
 		t.Fatalf("insert outbox row: %v", err)
 	}
+	_, err = db.RawDB().Exec(
+		`INSERT INTO outbox (content_hash, task_id, reply_to_comment_id, created_at, phase, comment_id)
+		 VALUES ('hash1', 'task-1', 'cmt-abc', 2, 'normal', 'cmt-abc')`)
+	if err == nil {
+		t.Error("expected PRIMARY KEY violation on duplicate content_hash, got nil")
+	}
 
-	// A second row with the same (comment_id, phase) must violate the unique index.
+	// Two rows with the same comment_id are allowed — no unique index on (comment_id, phase).
+	// OutboxInsertPhased deduplicates via the content_hash PK, not a secondary index.
 	_, err = db.RawDB().Exec(
 		`INSERT INTO outbox (content_hash, task_id, reply_to_comment_id, created_at, phase, comment_id)
 		 VALUES ('hash2', 'task-1', 'cmt-abc', 2, 'normal', 'cmt-abc')`)
-	if err == nil {
-		t.Error("expected UNIQUE constraint violation on (comment_id, phase), got nil")
+	if err != nil {
+		t.Errorf("two rows sharing comment_id should be allowed (no unique index): %v", err)
 	}
 
-	// A row with NULL reply_to_comment_id must get comment_id = '' (COALESCE result)
-	// after backfill; verify we can insert it without NOT NULL violation.
+	// A row with NULL reply_to_comment_id can use comment_id='' without NOT NULL violation.
 	_, err = db.RawDB().Exec(
 		`INSERT INTO outbox (content_hash, task_id, reply_to_comment_id, created_at, phase, comment_id)
 		 VALUES ('hash3', 'task-1', NULL, 3, 'normal', '')`)
 	if err != nil {
 		t.Fatalf("insert outbox row with NULL reply_to_comment_id: %v", err)
 	}
-
-	// Verify the row's comment_id is empty string (what COALESCE(NULL, '') would produce).
 	var commentID string
 	if err := db.RawDB().QueryRow(
 		`SELECT comment_id FROM outbox WHERE content_hash = 'hash3'`,
@@ -161,6 +164,73 @@ func TestMigration0002_OutboxBackfill(t *testing.T) {
 	}
 	if commentID != "" {
 		t.Errorf("expected comment_id='', got %q", commentID)
+	}
+}
+
+func TestMigration0003_NewColumns(t *testing.T) {
+	db := openTestDB(t)
+	var name string
+	if err := db.RawDB().QueryRow(
+		`SELECT name FROM pragma_table_info('inbox') WHERE name = 'compact_entered_at'`,
+	).Scan(&name); err != nil {
+		t.Errorf("inbox column compact_entered_at missing after migration 0003: %v", err)
+	}
+}
+
+func TestUpdateInboxPhase_SetsCompactEnteredAt(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	before := time.Now()
+	db.RawDB().Exec(`INSERT INTO inbox (comment_id,task_id,content,creator_id,created_at,source,phase)
+		VALUES ('C1','T1','hello','U1',1,'human','normal')`)
+
+	if err := db.UpdateInboxPhase(ctx, "C1", "compact", "hello"); err != nil {
+		t.Fatal(err)
+	}
+	var ceat *int64
+	db.RawDB().QueryRow(`SELECT compact_entered_at FROM inbox WHERE comment_id='C1'`).Scan(&ceat)
+	if ceat == nil {
+		t.Fatal("compact_entered_at must be set when transitioning to compact")
+	}
+	if *ceat < before.UnixMilli() {
+		t.Errorf("compact_entered_at %d is before test start %d", *ceat, before.UnixMilli())
+	}
+
+	// Transitioning to 'answer' must NOT overwrite compact_entered_at.
+	prevCeat := *ceat
+	if err := db.UpdateInboxPhase(ctx, "C1", "answer", "hello"); err != nil {
+		t.Fatal(err)
+	}
+	db.RawDB().QueryRow(`SELECT compact_entered_at FROM inbox WHERE comment_id='C1'`).Scan(&ceat)
+	if ceat == nil || *ceat != prevCeat {
+		t.Error("compact_entered_at must be preserved on non-compact phase transitions")
+	}
+}
+
+func TestListStuckCompactRows_UsesCompactEnteredAt(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+	now := time.Now().UnixMilli()
+	twoHoursAgoMs := now - 2*60*60*1000
+	oneHourAgoMs := now - 60*60*1000
+
+	// Stuck: compact_entered_at is 2 hours ago (older than 1h threshold).
+	db.RawDB().Exec(`INSERT INTO inbox (comment_id,task_id,content,creator_id,created_at,source,phase,compact_entered_at)
+		VALUES ('C1','T1','hi','U1',?,  'human','compact',?)`, now, twoHoursAgoMs)
+	// Pre-migration row: compact_entered_at IS NULL — must be invisible to watchdog.
+	db.RawDB().Exec(`INSERT INTO inbox (comment_id,task_id,content,creator_id,created_at,source,phase)
+		VALUES ('C2','T1','hi','U1',?)`, twoHoursAgoMs)
+	db.RawDB().Exec(`UPDATE inbox SET phase='compact' WHERE comment_id='C2'`)
+	// Recent: compact_entered_at just set — within threshold, must not alert.
+	db.RawDB().Exec(`INSERT INTO inbox (comment_id,task_id,content,creator_id,created_at,source,phase,compact_entered_at)
+		VALUES ('C3','T1','hi','U1',?, 'human','compact',?)`, now, now)
+
+	ids, err := db.ListStuckCompactRows(ctx, oneHourAgoMs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 1 || ids[0] != "C1" {
+		t.Errorf("want [C1], got %v", ids)
 	}
 }
 
