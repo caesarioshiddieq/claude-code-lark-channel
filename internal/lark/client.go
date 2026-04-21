@@ -34,10 +34,10 @@ type Creator struct {
 }
 
 type Comment struct {
-	CommentID string  `json:"comment_id"`
+	CommentID string  `json:"id"` // Lark Task v2 returns "id", not "comment_id"
 	Creator   Creator `json:"creator"`
 	Content   string  `json:"content"`
-	CreatedAt int64   `json:"created_at"` // milliseconds
+	CreatedAt int64   `json:"created_at,string"` // milliseconds; Lark returns as quoted string
 }
 
 type ListCommentsResult struct {
@@ -141,11 +141,11 @@ func (c *Client) ListComments(ctx context.Context, taskID, pageToken string) (Li
 	if err := validateID(taskID, "taskID"); err != nil {
 		return ListCommentsResult{}, err
 	}
-	params := map[string]string{"page_size": "50"}
+	params := map[string]string{"page_size": "50", "resource_type": "task", "resource_id": taskID}
 	if pageToken != "" {
 		params["page_token"] = pageToken
 	}
-	resp, err := c.doGET(ctx, "/task/v2/tasks/"+taskID+"/comments", params)
+	resp, err := c.doGET(ctx, "/task/v2/comments", params)
 	if err != nil {
 		return ListCommentsResult{}, err
 	}

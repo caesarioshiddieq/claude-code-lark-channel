@@ -12,9 +12,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/caesarioshiddieq/claude-code-lark-channel/internal/budget"
 	"github.com/caesarioshiddieq/claude-code-lark-channel/internal/echo"
+	"github.com/caesarioshiddieq/claude-code-lark-channel/internal/gc"
 	"github.com/caesarioshiddieq/claude-code-lark-channel/internal/lark"
-	q "github.com/caesarioshiddieq/claude-code-lark-channel/internal/sqlite"
+	sqlite "github.com/caesarioshiddieq/claude-code-lark-channel/internal/sqlite"
 	"github.com/caesarioshiddieq/claude-code-lark-channel/internal/worker"
 )
 
@@ -90,7 +92,7 @@ func isAllowed(creatorID string, allowList []string) bool {
 	return false
 }
 
-func pollOnce(ctx context.Context, client *lark.Client, db *q.DB, cfg config) {
+func pollOnce(ctx context.Context, client *lark.Client, db *sqlite.DB, cfg config) {
 	tasks, err := client.ListTasklistTasks(ctx, cfg.TasklistID)
 	if err != nil {
 		log.Printf("[poller] list tasks: %v", err)
@@ -104,7 +106,7 @@ func pollOnce(ctx context.Context, client *lark.Client, db *q.DB, cfg config) {
 	}
 }
 
-func pollTask(ctx context.Context, client *lark.Client, db *q.DB, taskID string, allowList []string) {
+func pollTask(ctx context.Context, client *lark.Client, db *sqlite.DB, taskID string, allowList []string) {
 	watermark, _, err := db.GetWatermark(ctx, taskID)
 	if err != nil {
 		log.Printf("[poller] get watermark task=%s: %v", taskID, err)
@@ -128,7 +130,7 @@ func pollTask(ctx context.Context, client *lark.Client, db *q.DB, taskID string,
 			if watermark != "" && c.CommentID <= watermark {
 				continue
 			}
-			if err := db.InsertInbox(ctx, taskID, c); err != nil {
+			if err := db.InsertHumanInbox(ctx, taskID, c); err != nil {
 				log.Printf("[poller] insert inbox task=%s comment=%s: %v", taskID, c.CommentID, err)
 			}
 			if latestID == "" || c.CommentID > latestID {
@@ -147,102 +149,214 @@ func pollTask(ctx context.Context, client *lark.Client, db *q.DB, taskID string,
 	}
 }
 
-func processOne(ctx context.Context, db *q.DB, client *lark.Client, maxTurns int) bool {
-	row, found, err := db.NextInboxRow(ctx)
+func getJitterMinutes() int {
+	if v := os.Getenv("NIGHT_JITTER_MINUTES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return 30
+}
+
+func resolveSession(ctx context.Context, db *sqlite.DB, taskID string) (uuid string, isNew bool, err error) {
+	uuid, exists, err := db.GetSession(ctx, taskID)
 	if err != nil {
-		log.Printf("[worker] next inbox: %v", err)
+		return "", false, err
+	}
+	if !exists {
+		uuid = newUUID()
+		if err := db.UpsertSession(ctx, taskID, uuid); err != nil {
+			return "", false, err
+		}
+		return uuid, true, nil
+	}
+	return uuid, false, nil
+}
+
+func postDeferredNotice(ctx context.Context, client *lark.Client, taskID, replyTo string) {
+	msg := "Autonomous spawn deferred until tonight (day-window active, 05:00–19:00 WIB)."
+	if _, err := client.PostComment(ctx, taskID, msg, replyTo); err != nil {
+		log.Printf("postDeferredNotice: %v", err)
+	}
+}
+
+func processOne(ctx context.Context, db *sqlite.DB, client *lark.Client, maxTurns int) bool {
+	row, ok, err := db.NextInboxRow(ctx)
+	if err != nil {
+		log.Printf("processOne: NextInboxRow: %v", err)
 		return false
 	}
-	if !found {
+	if !ok {
 		return false
+	}
+
+	if canSpawn, reason := budget.CanSpawn(ctx, row.Source, time.Now()); !canSpawn {
+		log.Printf("processOne: gated %s (%s): %s", row.CommentID, row.Source, reason)
+		nextNight := budget.JitteredNightStart(time.Now(), getJitterMinutes())
+		if err := db.MarkDeferred(ctx, row.CommentID, nextNight.UnixMilli(), row.Content); err != nil {
+			log.Printf("processOne: MarkDeferred: %v", err)
+		}
+		postDeferredNotice(ctx, client, row.TaskID, row.CommentID)
+		return true
 	}
 
 	lockFile, err := worker.LockTask(row.TaskID)
 	if err != nil {
-		log.Printf("[worker] lock task=%s: %v", row.TaskID, err)
+		log.Printf("processOne: LockTask %s: %v", row.TaskID, err)
 		return false
 	}
 	defer worker.UnlockTask(lockFile)
 
-	sessionUUID, found, err := db.GetSession(ctx, row.TaskID)
+	sessionUUID, isNew, err := resolveSession(ctx, db, row.TaskID)
 	if err != nil {
-		log.Printf("[worker] get session task=%s: %v", row.TaskID, err)
+		log.Printf("processOne: resolveSession %s: %v", row.TaskID, err)
 		return false
 	}
-	isNew := !found
-	if isNew {
-		sessionUUID = newUUID()
-		if err := db.UpsertSession(ctx, row.TaskID, sessionUUID); err != nil {
-			log.Printf("[worker] upsert session task=%s: %v", row.TaskID, err)
-			return false
-		}
-	}
 
-	prompt := row.Content
-	turns, err := db.GetTurnCount(ctx, row.TaskID)
-	if err != nil {
-		log.Printf("[worker] get turn count task=%s: %v", row.TaskID, err)
+	switch row.Phase {
+	case "answer":
+		return dispatchAnswer(ctx, db, client, row, sessionUUID)
+	case "compact":
+		return dispatchCompact(ctx, db, client, row, sessionUUID)
+	default:
+		return dispatchNormal(ctx, db, client, row, sessionUUID, isNew, maxTurns)
 	}
-	if turns > 0 && turns%maxTurns == 0 {
-		prompt = "/compact\n\n" + prompt
-	}
+}
 
-	reply, err := worker.SpawnClaude(ctx, sessionUUID, isNew, prompt)
-	if err != nil {
-		if ctx.Err() != nil {
-			// Graceful shutdown: leave row in inbox for next startup to retry.
-			log.Printf("[worker] spawn cancelled (shutdown), leaving task=%s comment=%s in inbox", row.TaskID, row.CommentID)
-			return false
-		}
-		log.Printf("[worker] spawn task=%s comment=%s: %v", row.TaskID, row.CommentID, err)
-		if dlqErr := db.MoveToDeadLetter(ctx, row.CommentID, row.TaskID, err.Error()); dlqErr != nil {
-			log.Printf("[worker] dlq move failed task=%s comment=%s: %v; marking processed", row.TaskID, row.CommentID, dlqErr)
-			if mErr := db.MarkInboxProcessed(ctx, row.CommentID); mErr != nil {
-				log.Printf("[worker] mark processed fallback failed comment=%s: %v", row.CommentID, mErr)
-			}
+func dispatchNormal(ctx context.Context, db *sqlite.DB, client *lark.Client,
+	row sqlite.InboxRow, sessionUUID string, isNew bool, maxTurns int) bool {
+
+	turnCount, tcErr := db.GetTurnCount(ctx, row.TaskID)
+	if tcErr != nil {
+		log.Printf("dispatchNormal: GetTurnCount %s: %v", row.TaskID, tcErr)
+	}
+	if turnCount+1 >= maxTurns {
+		if err := db.UpdateInboxPhase(ctx, row.CommentID, "compact", row.Content); err != nil {
+			log.Printf("dispatchNormal: UpdateInboxPhase(compact) %s: %v", row.CommentID, err)
 		}
 		return true
 	}
 
-	hash := worker.ContentHash(row.TaskID, reply)
-	existingID, found, outboxErr := db.OutboxCheck(ctx, hash)
-	if outboxErr != nil {
-		log.Printf("[worker] outbox check task=%s: %v", row.TaskID, outboxErr)
+	// Crash-recovery guard: if a prior run already inserted the outbox entry but crashed before
+	// MarkInboxProcessed, skip re-spawning Claude to avoid burning tokens a second time.
+	if _, alreadyPosted, checkErr := db.OutboxCheck(ctx, row.CommentID+":normal"); checkErr != nil {
+		log.Printf("dispatchNormal: OutboxCheck %s: %v", row.CommentID, checkErr)
+	} else if alreadyPosted {
+		log.Printf("dispatchNormal: skipping re-spawn for %s (outbox entry exists from prior run)", row.CommentID)
+		_ = db.MarkInboxProcessed(ctx, row.CommentID)
+		_ = db.IncrTurnCount(ctx, row.TaskID)
+		return true
 	}
-	if found {
-		if existingID != "" {
-			log.Printf("[worker] reply already posted (outbox hit) task=%s", row.TaskID)
-		} else {
-			// Crash-recovery: hash recorded but lark_comment_id not confirmed; re-post.
-			log.Printf("[worker] outbox half-posted state (re-posting) task=%s", row.TaskID)
-			if newCommentID, err := client.PostComment(ctx, row.TaskID, reply, row.CommentID); err != nil {
-				log.Printf("[worker] post comment task=%s: %v", row.TaskID, err)
-			} else {
-				if err := db.OutboxMarkPosted(ctx, hash, newCommentID); err != nil {
-					log.Printf("[worker] outbox mark posted task=%s: %v", row.TaskID, err)
-				}
-			}
+
+	result, err := worker.SpawnClaudeWithUsage(ctx, sessionUUID, isNew, row.Content)
+	if usageErr := db.InsertTurnUsage(ctx, sqlite.TurnUsage{
+		CommentID: row.CommentID, TaskID: row.TaskID, SessionUUID: sessionUUID, Phase: "normal",
+		InputTokens: result.InputTokens, OutputTokens: result.OutputTokens,
+		CacheReadTokens: result.CacheReadTokens, CacheCreationTokens: result.CacheCreationTokens,
+		IsRateLimitError: result.IsRateLimit,
+	}); usageErr != nil {
+		log.Printf("dispatchNormal: InsertTurnUsage %s: %v", row.CommentID, usageErr)
+	}
+	if err != nil {
+		log.Printf("dispatchNormal: spawn %s: %v", row.CommentID, err)
+		if dlqErr := db.MoveToDeadLetter(ctx, row.CommentID, row.TaskID, err.Error()); dlqErr != nil {
+			log.Printf("dispatchNormal: MoveToDeadLetter %s: %v", row.CommentID, dlqErr)
 		}
-	} else {
-		// Write-before-post: record hash before calling Lark to enable dedup on retry.
-		if err := db.OutboxInsert(ctx, hash, row.TaskID, row.CommentID); err != nil {
-			log.Printf("[worker] outbox insert task=%s: %v; aborting post to preserve dedup", row.TaskID, err)
-		} else {
-			if newCommentID, err := client.PostComment(ctx, row.TaskID, reply, row.CommentID); err != nil {
-				log.Printf("[worker] post comment task=%s: %v", row.TaskID, err)
-			} else {
-				if err := db.OutboxMarkPosted(ctx, hash, newCommentID); err != nil {
-					log.Printf("[worker] outbox mark posted task=%s: %v", row.TaskID, err)
-				}
-			}
+		return true
+	}
+
+	inserted, outboxErr := db.OutboxInsertPhased(ctx, row.CommentID, row.TaskID, row.CommentID, "normal")
+	if outboxErr != nil {
+		log.Printf("dispatchNormal: OutboxInsertPhased %s: %v", row.CommentID, outboxErr)
+	}
+	if inserted {
+		if _, err := client.PostComment(ctx, row.TaskID, result.Reply, row.CommentID); err != nil {
+			log.Printf("dispatchNormal: PostComment %s: %v", row.CommentID, err)
+			return true
 		}
 	}
 
-	if err := db.MarkInboxProcessed(ctx, row.CommentID); err != nil {
-		log.Printf("[worker] mark processed comment=%s: %v", row.CommentID, err)
+	if markErr := db.MarkInboxProcessed(ctx, row.CommentID); markErr != nil {
+		log.Printf("dispatchNormal: MarkInboxProcessed %s: %v", row.CommentID, markErr)
 	}
-	if err := db.IncrTurnCount(ctx, row.TaskID); err != nil {
-		log.Printf("[worker] incr turn count task=%s: %v", row.TaskID, err)
+	if incrErr := db.IncrTurnCount(ctx, row.TaskID); incrErr != nil {
+		log.Printf("dispatchNormal: IncrTurnCount %s: %v", row.TaskID, incrErr)
+	}
+	return true
+}
+
+func dispatchCompact(ctx context.Context, db *sqlite.DB, client *lark.Client,
+	row sqlite.InboxRow, sessionUUID string) bool {
+
+	result, err := worker.RunCompactPhase(ctx, sessionUUID)
+	if usageErr := db.InsertTurnUsage(ctx, sqlite.TurnUsage{
+		CommentID: row.CommentID, TaskID: row.TaskID, SessionUUID: sessionUUID, Phase: "compact",
+		InputTokens: result.InputTokens, OutputTokens: result.OutputTokens,
+		CacheReadTokens: result.CacheReadTokens, CacheCreationTokens: result.CacheCreationTokens,
+		IsRateLimitError: result.IsRateLimit,
+	}); usageErr != nil {
+		log.Printf("dispatchCompact: InsertTurnUsage %s: %v", row.CommentID, usageErr)
+	}
+	if err != nil {
+		log.Printf("dispatchCompact: spawn error %s — resetting to normal: %v", row.CommentID, err)
+		if resetErr := db.ResetInboxPhase(ctx, row.CommentID); resetErr != nil {
+			log.Printf("dispatchCompact: ResetInboxPhase %s: %v", row.CommentID, resetErr)
+		}
+		return true
+	}
+
+	insertedCompact, outboxErr := db.OutboxInsertPhased(ctx, row.CommentID, row.TaskID, row.CommentID, "compact")
+	if outboxErr != nil {
+		log.Printf("dispatchCompact: OutboxInsertPhased %s: %v", row.CommentID, outboxErr)
+	}
+	if insertedCompact {
+		if _, err := client.PostComment(ctx, row.TaskID,
+			"Context summarized (turn cap reached).", row.CommentID); err != nil {
+			log.Printf("dispatchCompact: PostComment %s: %v", row.CommentID, err)
+		}
+	}
+	if phaseErr := db.UpdateInboxPhase(ctx, row.CommentID, "answer", row.OriginalContent); phaseErr != nil {
+		log.Printf("dispatchCompact: UpdateInboxPhase %s: %v", row.CommentID, phaseErr)
+	}
+	return true
+}
+
+func dispatchAnswer(ctx context.Context, db *sqlite.DB, client *lark.Client,
+	row sqlite.InboxRow, sessionUUID string) bool {
+
+	result, err := worker.RunAnswerPhase(ctx, sessionUUID, row.OriginalContent)
+	if usageErr := db.InsertTurnUsage(ctx, sqlite.TurnUsage{
+		CommentID: row.CommentID, TaskID: row.TaskID, SessionUUID: sessionUUID, Phase: "answer",
+		InputTokens: result.InputTokens, OutputTokens: result.OutputTokens,
+		CacheReadTokens: result.CacheReadTokens, CacheCreationTokens: result.CacheCreationTokens,
+		IsRateLimitError: result.IsRateLimit,
+	}); usageErr != nil {
+		log.Printf("dispatchAnswer: InsertTurnUsage %s: %v", row.CommentID, usageErr)
+	}
+	if err != nil {
+		log.Printf("dispatchAnswer: spawn %s: %v", row.CommentID, err)
+		if dlqErr := db.MoveToDeadLetter(ctx, row.CommentID, row.TaskID, err.Error()); dlqErr != nil {
+			log.Printf("dispatchAnswer: MoveToDeadLetter %s: %v", row.CommentID, dlqErr)
+		}
+		return true
+	}
+
+	insertedAnswer, outboxErr := db.OutboxInsertPhased(ctx, row.CommentID, row.TaskID, row.CommentID, "answer")
+	if outboxErr != nil {
+		log.Printf("dispatchAnswer: OutboxInsertPhased %s: %v", row.CommentID, outboxErr)
+	}
+	if insertedAnswer {
+		if _, err := client.PostComment(ctx, row.TaskID, result.Reply, row.CommentID); err != nil {
+			log.Printf("dispatchAnswer: PostComment %s: %v", row.CommentID, err)
+			return true
+		}
+	}
+
+	if resetErr := db.ResetTurnCount(ctx, row.TaskID); resetErr != nil {
+		log.Printf("dispatchAnswer: ResetTurnCount %s: %v", row.TaskID, resetErr)
+	}
+	if markErr := db.MarkInboxProcessed(ctx, row.CommentID); markErr != nil {
+		log.Printf("dispatchAnswer: MarkInboxProcessed %s: %v", row.CommentID, markErr)
 	}
 	return true
 }
@@ -265,7 +379,7 @@ func newUUID() string {
 func main() {
 	cfg := loadConfig()
 
-	db, err := q.Open(cfg.DBPath)
+	db, err := sqlite.Open(cfg.DBPath)
 	if err != nil {
 		log.Fatalf("open db: %v", err)
 	}
@@ -277,6 +391,12 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
+
+	if err := budget.ReconcileStaleDeferrals(ctx, db, time.Now()); err != nil {
+		log.Printf("boot reconciler: %v", err)
+	}
+	budget.RunWatchdog(ctx, db)
+	gc.RunUsageGC(ctx, db)
 
 	pollTicker := time.NewTicker(cfg.PollInterval)
 	defer pollTicker.Stop()

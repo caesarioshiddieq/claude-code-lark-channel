@@ -26,7 +26,7 @@ func TestListComments_ReturnsItems(t *testing.T) {
 			"code": 0,
 			"data": map[string]any{
 				"items": []map[string]any{
-					{"comment_id": "c1", "content": "hello", "created_at": int64(1000),
+					{"id": "c1", "content": "hello", "created_at": "1000",
 						"creator": map[string]any{"id": "u1", "type": "user"}},
 				},
 				"has_more": false, "page_token": "",
@@ -53,7 +53,7 @@ func TestPostComment_ReturnsCommentID(t *testing.T) {
 		}
 		json.NewEncoder(w).Encode(map[string]any{
 			"code": 0,
-			"data": map[string]any{"comment": map[string]any{"comment_id": "new-c99"}},
+			"data": map[string]any{"comment": map[string]any{"id": "new-c99"}},
 		})
 	}))
 	defer srv.Close()
