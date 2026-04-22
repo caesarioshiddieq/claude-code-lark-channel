@@ -6,11 +6,22 @@ import (
 	"os"
 	"strconv"
 	"time"
+	_ "time/tzdata"
 )
 
 // GCer abstracts the DB delete for usage GC.
 type GCer interface {
 	DeleteOldTurnUsage(ctx context.Context, olderThanMs int64) (int64, error)
+}
+
+var jakarta *time.Location
+
+func init() {
+	var err error
+	jakarta, err = time.LoadLocation("Asia/Jakarta")
+	if err != nil {
+		panic("gc: cannot load Asia/Jakarta: " + err.Error())
+	}
 }
 
 func retentionDays() int {
@@ -22,9 +33,10 @@ func retentionDays() int {
 	return 30
 }
 
-func nextGCTime() time.Time {
-	now := time.Now()
-	t := time.Date(now.Year(), now.Month(), now.Day(), 3, 0, 0, 0, now.Location())
+// nextGCTime returns the next 03:00 Asia/Jakarta after now.
+func nextGCTime(now time.Time) time.Time {
+	local := now.In(jakarta)
+	t := time.Date(local.Year(), local.Month(), local.Day(), 3, 0, 0, 0, jakarta)
 	if !t.After(now) {
 		t = t.AddDate(0, 0, 1)
 	}
@@ -32,11 +44,11 @@ func nextGCTime() time.Time {
 }
 
 // RunUsageGC starts a goroutine that deletes turn_usage rows older than USAGE_RETENTION_DAYS.
-// Runs daily at 03:00 local time.
+// Runs daily at 03:00 Asia/Jakarta.
 func RunUsageGC(ctx context.Context, g GCer) {
 	go func() {
 		for {
-			next := nextGCTime()
+			next := nextGCTime(time.Now())
 			select {
 			case <-ctx.Done():
 				return
