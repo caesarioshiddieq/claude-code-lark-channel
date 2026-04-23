@@ -321,6 +321,40 @@ func TestPool_NoBusyLoopWhenEmpty(t *testing.T) {
 	}
 }
 
+// TestPool_FastFailBackoff verifies the pool does not tight-spin on a row whose Process
+// returns fast without marking it processed, as long as Process honours the fast-fail contract
+// (calling MarkDeferred with a future scheduled_for). Models the real-world fix where
+// processOne defers the row on LockTask / resolveSession errors so the dispatcher's next
+// NextInboxRowExcluding call skips it via the scheduled_for <= now SQL filter.
+func TestPool_FastFailBackoff(t *testing.T) {
+	defer goleak.VerifyNone(t)
+	db := newTestDB(t)
+	defer db.Close()
+	insertRow(t, db, "C1", "task-a", 1)
+
+	var calls atomic.Int32
+	process := func(ctx context.Context, row sqlite.InboxRow) {
+		calls.Add(1)
+		// Simulate processOne's fast-fail path: defer ~30s, do NOT mark processed.
+		backoff := time.Now().Add(30 * time.Second).UnixMilli()
+		if err := db.MarkDeferred(context.Background(), row.CommentID, backoff, row.Content); err != nil {
+			t.Errorf("MarkDeferred: %v", err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	pool := worker.NewPool(worker.ProcessDeps{DB: db, Process: process}, 1)
+	pool.Run(ctx)
+
+	// With the backoff applied, the row should not be re-picked within the 2s window.
+	// Without the fix, the pool would re-pick the same row at CPU speed (hundreds of calls).
+	if n := calls.Load(); n != 1 {
+		t.Errorf("Process called %d times; want exactly 1 (tight-spin regression?)", n)
+	}
+}
+
 // TestPool_ShutdownWhileBlockedOnSem verifies that when the dispatcher is blocked on the semaphore
 // at ctx cancel, it removes the claimed-but-not-dispatched task from the busy map.
 func TestPool_ShutdownWhileBlockedOnSem(t *testing.T) {

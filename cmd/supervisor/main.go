@@ -180,6 +180,19 @@ func postDeferredNotice(ctx context.Context, client *lark.Client, taskID, replyT
 	}
 }
 
+// fastFailBackoff returns a near-future timestamp (30–60s ahead) used with MarkDeferred
+// to prevent the worker pool from re-picking a row that just hit a fast-fail path (e.g.
+// LockTask or resolveSession error). Without this the row is re-queued instantly and the
+// dispatcher hammers SQLite at CPU speed until the underlying error clears.
+func fastFailBackoff() time.Time {
+	buf := make([]byte, 4)
+	var jitterSec int
+	if _, err := rand.Read(buf); err == nil {
+		jitterSec = int(uint32(buf[0])<<24|uint32(buf[1])<<16|uint32(buf[2])<<8|uint32(buf[3])) % 31
+	}
+	return time.Now().Add(time.Duration(30+jitterSec) * time.Second)
+}
+
 func processOne(ctx context.Context, db *sqlite.DB, client *lark.Client, maxTurns int, row sqlite.InboxRow) {
 	if canSpawn, reason := budget.CanSpawn(ctx, row.Source, time.Now()); !canSpawn {
 		log.Printf("processOne: gated %s (%s): %s", row.CommentID, row.Source, reason)
@@ -194,6 +207,9 @@ func processOne(ctx context.Context, db *sqlite.DB, client *lark.Client, maxTurn
 	lockFile, err := worker.LockTask(row.TaskID)
 	if err != nil {
 		log.Printf("processOne: LockTask %s: %v", row.TaskID, err)
+		if markErr := db.MarkDeferred(ctx, row.CommentID, fastFailBackoff().UnixMilli(), row.Content); markErr != nil {
+			log.Printf("processOne: MarkDeferred (LockTask fail): %v", markErr)
+		}
 		return
 	}
 	defer worker.UnlockTask(lockFile)
@@ -201,6 +217,9 @@ func processOne(ctx context.Context, db *sqlite.DB, client *lark.Client, maxTurn
 	sessionUUID, isNew, err := resolveSession(ctx, db, row.TaskID)
 	if err != nil {
 		log.Printf("processOne: resolveSession %s: %v", row.TaskID, err)
+		if markErr := db.MarkDeferred(ctx, row.CommentID, fastFailBackoff().UnixMilli(), row.Content); markErr != nil {
+			log.Printf("processOne: MarkDeferred (resolveSession fail): %v", markErr)
+		}
 		return
 	}
 
@@ -409,7 +428,11 @@ func main() {
 
 	maxConcurrent := 1
 	if v := os.Getenv("MAX_CONCURRENT_SPAWNS_GLOBAL"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
+		n, err := strconv.Atoi(v)
+		switch {
+		case err != nil:
+			log.Printf("[supervisor] WARN: invalid MAX_CONCURRENT_SPAWNS_GLOBAL=%q (%v), using default %d", v, err, maxConcurrent)
+		default:
 			if n < 1 {
 				n = 1
 			}
