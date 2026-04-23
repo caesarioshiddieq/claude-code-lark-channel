@@ -51,7 +51,7 @@ Expose SQL-derived application metrics from the `claude-code-vm` supervisor, for
 ### 1. New Go package `internal/metrics/`
 
 **Files:**
-- `metrics.go` — `Collector` struct implementing `prometheus.Collector`, plus a `Handler(db *sqlite.DB) http.Handler` constructor that returns a pre-wired `promhttp.Handler`.
+- `metrics.go` — `Collector` struct implementing `prometheus.Collector`, plus a `Handler(c *Collector) http.Handler` constructor that returns a pre-wired `promhttp.Handler` (see Public API below for full signatures).
 - `metrics_test.go` — seed rows in test DB, hit handler via `httptest`, assert output.
 
 **Public API:**
@@ -240,7 +240,8 @@ Table-driven coverage for `Collector.Collect`:
 3. **Non-zero DLQ** — dlq_size reports count
 4. **Inbox backlog** — only unprocessed rows counted (mixed processed_at=NULL / NOT NULL seed)
 5. **Histogram buckets** — seed 5 rows with durations [3000, 8000, 25000, 90000, 350000]ms, assert bucket counts match
-6. **Query timeout path** — inject a blocking query via test-only hook, assert 503 + `scrape_errors_total++`
+6. **Single-query timeout path (partial failure)** — inject a blocking query for ONE metric via test-only hook, assert HTTP 200, asserted family is absent from output, other families present, `scrape_errors_total{query="<injected>"}` incremented by 1
+7. **All-queries-fail path (total failure)** — close the DB connection before Collect(), assert HTTP 503, no `supervisor_*` business metrics in output, `scrape_errors_total` present for every query label
 
 ### Fault-injection tests (per Codex Refactor #8)
 
@@ -248,7 +249,7 @@ In `internal/metrics/metrics_fault_test.go` (new file, `_test.go` naming keeps t
 
 1. **GC during scrape** — `go DeleteOldTurnUsage()`, immediately `go Collect()`; assert scrape doesn't error, result is deterministic (either pre or post-GC state, not partial)
 2. **Concurrent writes + scrape** — 4 goroutines hammer `InsertHumanInbox`/`InsertTurnUsage` while scrape runs; assert scrape completes within 2s budget
-3. **Scrape timeout → 503** — already in unit tests #6
+3. **Scrape failure paths** — already covered in unit tests #6 (single-query timeout → 200 partial) and #7 (all-queries-fail → 503)
 
 Target: 80%+ coverage on `internal/metrics/`. All new tests pass with `-race`.
 
