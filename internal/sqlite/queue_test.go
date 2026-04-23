@@ -431,6 +431,52 @@ func TestListStaleDeferrals_Boundary(t *testing.T) {
 	}
 }
 
+func TestNextInboxRowExcluding(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// Seed 3 rows for distinct task IDs, all immediately eligible.
+	db.RawDB().Exec(`INSERT INTO inbox (comment_id,task_id,content,creator_id,created_at,source,phase)
+		VALUES ('C1','task-a','hi','U1',1,'human','normal')`)
+	db.RawDB().Exec(`INSERT INTO inbox (comment_id,task_id,content,creator_id,created_at,source,phase)
+		VALUES ('C2','task-b','hi','U1',2,'human','normal')`)
+	db.RawDB().Exec(`INSERT INTO inbox (comment_id,task_id,content,creator_id,created_at,source,phase)
+		VALUES ('C3','task-c','hi','U1',3,'human','normal')`)
+
+	// Busy=[task-a, task-b] → only task-c row should be returned.
+	row, found, err := db.NextInboxRowExcluding(ctx, []string{"task-a", "task-b"})
+	if err != nil {
+		t.Fatalf("NextInboxRowExcluding: %v", err)
+	}
+	if !found {
+		t.Fatal("expected a row for task-c")
+	}
+	if row.TaskID != "task-c" || row.CommentID != "C3" {
+		t.Errorf("want task-c/C3, got task=%s comment=%s", row.TaskID, row.CommentID)
+	}
+
+	// Empty busy slice → same result as NextInboxRow (first by phase/created_at = C1).
+	row2, found2, err := db.NextInboxRowExcluding(ctx, nil)
+	if err != nil {
+		t.Fatalf("NextInboxRowExcluding(nil): %v", err)
+	}
+	if !found2 {
+		t.Fatal("expected a row with empty busy list")
+	}
+	if row2.CommentID != "C1" {
+		t.Errorf("empty busy: want C1, got %s", row2.CommentID)
+	}
+
+	// All tasks busy → no row.
+	_, found3, err := db.NextInboxRowExcluding(ctx, []string{"task-a", "task-b", "task-c"})
+	if err != nil {
+		t.Fatalf("NextInboxRowExcluding(all busy): %v", err)
+	}
+	if found3 {
+		t.Error("expected no row when all tasks are busy")
+	}
+}
+
 func TestMigration0002_BackfillUpdatesExistingRows(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "backfill_real.db")
 

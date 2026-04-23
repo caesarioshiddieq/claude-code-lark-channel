@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/caesarioshiddieq/claude-code-lark-channel/internal/budget"
@@ -209,6 +210,46 @@ func (d *DB) NextInboxRow(ctx context.Context) (InboxRow, bool, error) {
 	}
 	if err != nil {
 		return InboxRow{}, false, fmt.Errorf("next inbox row: %w", err)
+	}
+	return r, true, nil
+}
+
+func (d *DB) NextInboxRowExcluding(ctx context.Context, busyTaskIDs []string) (InboxRow, bool, error) {
+	if len(busyTaskIDs) == 0 {
+		return d.NextInboxRow(ctx)
+	}
+	placeholders := make([]string, len(busyTaskIDs))
+	args := make([]interface{}, len(busyTaskIDs)+1)
+	args[0] = time.Now().UnixMilli()
+	for i, id := range busyTaskIDs {
+		placeholders[i] = "?"
+		args[i+1] = id
+	}
+	q := `
+		SELECT comment_id, task_id, content, creator_id,
+		       COALESCE(source,'human'), COALESCE(phase,'normal'),
+		       COALESCE(original_content,'')
+		FROM inbox
+		WHERE processed_at IS NULL
+		  AND (scheduled_for IS NULL OR scheduled_for <= ?)
+		  AND task_id NOT IN (` + strings.Join(placeholders, ",") + `)
+		ORDER BY
+		  CASE phase
+		    WHEN 'answer'  THEN 1
+		    WHEN 'compact' THEN 2
+		    ELSE               3
+		  END,
+		  created_at ASC
+		LIMIT 1`
+	var r InboxRow
+	err := d.db.QueryRowContext(ctx, q, args...).Scan(
+		&r.CommentID, &r.TaskID, &r.Content, &r.CreatorID,
+		&r.Source, &r.Phase, &r.OriginalContent)
+	if errors.Is(err, sql.ErrNoRows) {
+		return InboxRow{}, false, nil
+	}
+	if err != nil {
+		return InboxRow{}, false, fmt.Errorf("next inbox row excluding: %w", err)
 	}
 	return r, true, nil
 }

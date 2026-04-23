@@ -180,16 +180,20 @@ func postDeferredNotice(ctx context.Context, client *lark.Client, taskID, replyT
 	}
 }
 
-func processOne(ctx context.Context, db *sqlite.DB, client *lark.Client, maxTurns int) bool {
-	row, ok, err := db.NextInboxRow(ctx)
-	if err != nil {
-		log.Printf("processOne: NextInboxRow: %v", err)
-		return false
+// fastFailBackoff returns a near-future timestamp (30–60s ahead) used with MarkDeferred
+// to prevent the worker pool from re-picking a row that just hit a fast-fail path (e.g.
+// LockTask or resolveSession error). Without this the row is re-queued instantly and the
+// dispatcher hammers SQLite at CPU speed until the underlying error clears.
+func fastFailBackoff() time.Time {
+	buf := make([]byte, 4)
+	var jitterSec int
+	if _, err := rand.Read(buf); err == nil {
+		jitterSec = int(uint32(buf[0])<<24|uint32(buf[1])<<16|uint32(buf[2])<<8|uint32(buf[3])) % 31
 	}
-	if !ok {
-		return false
-	}
+	return time.Now().Add(time.Duration(30+jitterSec) * time.Second)
+}
 
+func processOne(ctx context.Context, db *sqlite.DB, client *lark.Client, maxTurns int, row sqlite.InboxRow) {
 	if canSpawn, reason := budget.CanSpawn(ctx, row.Source, time.Now()); !canSpawn {
 		log.Printf("processOne: gated %s (%s): %s", row.CommentID, row.Source, reason)
 		nextNight := budget.JitteredNightStart(time.Now(), getJitterMinutes())
@@ -197,29 +201,35 @@ func processOne(ctx context.Context, db *sqlite.DB, client *lark.Client, maxTurn
 			log.Printf("processOne: MarkDeferred: %v", err)
 		}
 		postDeferredNotice(ctx, client, row.TaskID, row.CommentID)
-		return true
+		return
 	}
 
 	lockFile, err := worker.LockTask(row.TaskID)
 	if err != nil {
 		log.Printf("processOne: LockTask %s: %v", row.TaskID, err)
-		return false
+		if markErr := db.MarkDeferred(ctx, row.CommentID, fastFailBackoff().UnixMilli(), row.Content); markErr != nil {
+			log.Printf("processOne: MarkDeferred (LockTask fail): %v", markErr)
+		}
+		return
 	}
 	defer worker.UnlockTask(lockFile)
 
 	sessionUUID, isNew, err := resolveSession(ctx, db, row.TaskID)
 	if err != nil {
 		log.Printf("processOne: resolveSession %s: %v", row.TaskID, err)
-		return false
+		if markErr := db.MarkDeferred(ctx, row.CommentID, fastFailBackoff().UnixMilli(), row.Content); markErr != nil {
+			log.Printf("processOne: MarkDeferred (resolveSession fail): %v", markErr)
+		}
+		return
 	}
 
 	switch row.Phase {
 	case "answer":
-		return dispatchAnswer(ctx, db, client, row, sessionUUID)
+		dispatchAnswer(ctx, db, client, row, sessionUUID)
 	case "compact":
-		return dispatchCompact(ctx, db, client, row, sessionUUID)
+		dispatchCompact(ctx, db, client, row, sessionUUID)
 	default:
-		return dispatchNormal(ctx, db, client, row, sessionUUID, isNew, maxTurns)
+		dispatchNormal(ctx, db, client, row, sessionUUID, isNew, maxTurns)
 	}
 }
 
@@ -416,14 +426,28 @@ func main() {
 		}
 	}()
 
-	// Worker loop: drain inbox continuously; sleep 500ms when queue is empty.
-	for ctx.Err() == nil {
-		if !processOne(ctx, db, client, cfg.MaxTurnsPerSession) {
-			select {
-			case <-ctx.Done():
-			case <-time.After(500 * time.Millisecond):
+	maxConcurrent := 1
+	if v := os.Getenv("MAX_CONCURRENT_SPAWNS_GLOBAL"); v != "" {
+		n, err := strconv.Atoi(v)
+		switch {
+		case err != nil:
+			log.Printf("[supervisor] WARN: invalid MAX_CONCURRENT_SPAWNS_GLOBAL=%q (%v), using default %d", v, err, maxConcurrent)
+		default:
+			if n < 1 {
+				n = 1
 			}
+			if n > 4 {
+				n = 4
+			}
+			maxConcurrent = n
 		}
 	}
+	log.Printf("[supervisor] MAX_CONCURRENT_SPAWNS_GLOBAL=%d", maxConcurrent)
+	worker.NewPool(worker.ProcessDeps{
+		DB: db,
+		Process: func(ctx context.Context, row sqlite.InboxRow) {
+			processOne(ctx, db, client, cfg.MaxTurnsPerSession, row)
+		},
+	}, maxConcurrent).Run(ctx)
 	log.Println("[supervisor] shutting down")
 }

@@ -23,6 +23,13 @@ func lockDir() string {
 
 // LockTask acquires an exclusive flock on the per-task lock file.
 // Caller must call UnlockTask when done.
+//
+// This is redundant with the in-process busy-task map in worker.Pool —
+// but flock is kept as defense in depth: (a) protects against a second
+// supervisor binary accidentally running on the same VM, (b) protects
+// against a human operator running `claude -p` directly against the
+// session dir. Do not remove without first proving both cases cannot
+// happen in production.
 func LockTask(taskID string) (*os.File, error) {
 	lockPath := filepath.Join(lockDir(), taskID, "lock")
 	// Guard against path traversal: ensure lockPath stays within lockDir()
