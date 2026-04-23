@@ -69,9 +69,13 @@ func NewCollector(db *sqlite.DB) *Collector
 // Describe implements prometheus.Collector.
 func (c *Collector) Describe(ch chan<- *prometheus.Desc)
 
-// Collect implements prometheus.Collector. On each scrape it runs the SQL
-// aggregates and emits metrics via prometheus.MustNewConstMetric and
-// prometheus.MustNewConstHistogram. No accumulated histogram state.
+// Collect implements prometheus.Collector. On each scrape it opens a
+// BEGIN DEFERRED transaction (SQLite WAL mode → consistent snapshot of reader
+// state across all aggregates), runs the SQL queries, COMMITs, and emits
+// metrics via prometheus.MustNewConstMetric and prometheus.MustNewConstHistogram.
+// A top-level defer recover() catches any panic, increments
+// scrape_errors_total{query="panic"}, and returns normally — never re-panics.
+// No accumulated histogram state.
 func (c *Collector) Collect(ch chan<- prometheus.Metric)
 
 // Handler returns an http.Handler that exposes the collector's metrics via
@@ -92,7 +96,14 @@ func Handler(c *Collector) http.Handler
 | `supervisor_spawn_duration_seconds` | Histogram | `phase` | Bucket-aggregate SQL (see Histogram note below); `WHERE spawn_duration_ms IS NOT NULL AND created_at > now - 1h` |
 | `supervisor_metrics_scrape_errors_total` | Counter | `query` (spawns/tokens/dlq/inbox_backlog/spawn_duration/panic) | In-memory, incremented per query on failure |
 
-**Histogram note:** `spawn_duration_seconds` buckets = `[5, 10, 30, 60, 120, 300]` seconds. Computed each `Collect()` call from `turn_usage.spawn_duration_ms` rows inserted in the last 1 hour. Implementation uses `prometheus.MustNewConstHistogram(desc, sampleCount, sampleSum, bucketCountsMap)` — bucket counts are derived in a single SQL query (`SELECT CASE WHEN spawn_duration_ms < 5000 THEN '5' ... END bucket, COUNT(*), SUM(spawn_duration_ms) FROM turn_usage WHERE spawn_duration_ms IS NOT NULL AND created_at > now - 1h GROUP BY bucket`). No Go-level histogram state accumulates; each scrape reflects the same 1h window.
+**Histogram note:** `spawn_duration_seconds` buckets = `[5, 10, 30, 60, 120, 300]` seconds. Computed each `Collect()` call from `turn_usage.spawn_duration_ms` rows inserted in the last 1 hour, **grouped by `phase`** so the histogram's `phase` label is honored. Implementation pattern:
+
+1. Single SQL query: `SELECT phase, CASE WHEN spawn_duration_ms < 5000 THEN 5 WHEN spawn_duration_ms < 10000 THEN 10 ... ELSE 999999 END AS bucket, COUNT(*) AS n, SUM(spawn_duration_ms) AS sum_ms FROM turn_usage WHERE spawn_duration_ms IS NOT NULL AND created_at > (strftime('%s','now','-1 hour') * 1000) GROUP BY phase, bucket`
+2. In-memory pivot: build a `map[phase]map[float64]uint64` (phase → bucket-upper-bound-seconds → cumulative count) + per-phase `sampleCount` and `sampleSum`
+3. For each phase observed, emit ONE `prometheus.MustNewConstHistogram(desc, sampleCount, sampleSum, bucketCountsMap, phase)` via the Collect channel
+4. Phases with zero rows in the window emit nothing (no empty histograms)
+
+No Go-level histogram state accumulates; each scrape reflects the same 1h window, partitioned by phase.
 
 **Naming rationale (`_last_30d` over `_total`):** The `usage_gc` cron deletes `turn_usage` rows older than 30 days at 03:00 WIB. If we named these `_total` and backed them with `COUNT(*)`, the post-GC drop would look like a counter reset to Prometheus/Cloud Monitoring, creating false spikes in `rate()`/`increase()` calculations. Gauge naming is honest.
 
@@ -218,7 +229,7 @@ Apply: `gcloud monitoring dashboards create --config-from-file=infra/cloud-monit
 
 - **At least one family succeeded** → `200 OK` with the succeeded families only (promhttp default behavior)
 - **All families failed** → Collector emits only `scrape_errors_total` + sets a response header `X-Scrape-Status: all-failed`; the handler wrapper inspects the Registry's output and returns **503** when no `supervisor_*` business metric was emitted
-- **Handler panic** → recovered by `promhttp` middleware; `scrape_errors_total++`; returns 500
+- **Handler panic** → `Collect()` has its own `defer recover()` that: logs, increments `scrape_errors_total{query="panic"}`, and swallows the panic so only previously-emitted successful metrics (if any) appear in the response. `promhttp` sees a normal (possibly empty) return and serves whatever was already sent to the channel; the panic never reaches `promhttp`. HTTP status is 200 (partial) if ANY family succeeded before the panic, 503 if nothing was emitted.
 
 | Failure | Response |
 |---|---|
@@ -226,7 +237,7 @@ Apply: `gcloud monitoring dashboards create --config-from-file=infra/cloud-monit
 | Individual SQL query error | Wrap with `fmt.Errorf("metrics: %s: %w", queryName, err)`, log once per 60s per query, `scrape_errors_total{query=...}++`, omit that family |
 | ALL queries fail in one scrape | 503 response, all families absent, only `scrape_errors_total` visible |
 | HTTP bind failure at startup | Log `[metrics] bind %s: %v` and **exit** — misconfig should surface immediately |
-| Collector `Collect()` panic | Recovered by promhttp; `scrape_errors_total{query="panic"}++`; returns 500 |
+| Collector `Collect()` panic | Recovered by in-method `defer recover()`; `scrape_errors_total{query="panic"}++`; swallowed — promhttp returns 200 (partial) or 503 (nothing emitted), per partial-failure rule |
 | `METRICS_ADDR` unset | Default `127.0.0.1:9090`; empty string explicitly disables metrics goroutine |
 
 ## Testing strategy
@@ -247,7 +258,7 @@ Table-driven coverage for `Collector.Collect`:
 
 In `internal/metrics/metrics_fault_test.go` (new file, `_test.go` naming keeps them excluded from prod):
 
-1. **GC during scrape** — `go DeleteOldTurnUsage()`, immediately `go Collect()`; assert scrape doesn't error, result is deterministic (either pre or post-GC state, not partial)
+1. **GC during scrape** — `go DeleteOldTurnUsage()`, immediately `go Collect()`; assert scrape doesn't error AND the output reflects a consistent snapshot (either fully pre-GC or fully post-GC row counts, never mixed). The `BEGIN DEFERRED` transaction in `Collect()` is what makes this deterministic on WAL-mode SQLite. If future refactoring drops the transaction, this test must fail.
 2. **Concurrent writes + scrape** — 4 goroutines hammer `InsertHumanInbox`/`InsertTurnUsage` while scrape runs; assert scrape completes within 2s budget
 3. **Scrape failure paths** — already covered in unit tests #6 (single-query timeout → 200 partial) and #7 (all-queries-fail → 503)
 
