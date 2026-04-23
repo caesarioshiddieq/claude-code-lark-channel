@@ -57,30 +57,42 @@ Expose SQL-derived application metrics from the `claude-code-vm` supervisor, for
 **Public API:**
 ```go
 type Collector struct {
-    db *sqlite.DB
-    // Internal self-observability counters
-    scrapeErrors prometheus.Counter
+    db            *sqlite.DB
+    descs         collectorDescs // pre-built *prometheus.Desc values (name+labels metadata only)
+    scrapeErrors  *prometheus.CounterVec // labeled by query name (spawns/tokens/dlq/...); long-lived in-memory
 }
 
-// NewCollector returns a Collector registered with its own private Registry.
+// NewCollector creates the Collector. It pre-builds metric Descs but holds no
+// per-scrape values — every Collect() call runs fresh SQL and emits fresh metrics.
 func NewCollector(db *sqlite.DB) *Collector
 
-// Handler returns an http.Handler that exposes the collector's metrics.
+// Describe implements prometheus.Collector.
+func (c *Collector) Describe(ch chan<- *prometheus.Desc)
+
+// Collect implements prometheus.Collector. On each scrape it runs the SQL
+// aggregates and emits metrics via prometheus.MustNewConstMetric and
+// prometheus.MustNewConstHistogram. No accumulated histogram state.
+func (c *Collector) Collect(ch chan<- prometheus.Metric)
+
+// Handler returns an http.Handler that exposes the collector's metrics via
+// promhttp.HandlerFor on a private Registry (registered at construction).
 func Handler(c *Collector) http.Handler
 ```
+
+**Lifecycle invariant**: the `Collector` is created once at supervisor startup and reused. It holds no mutable Go-level histogram state — bucket counts are computed from SQL each `Collect()` call and emitted via `prometheus.MustNewConstHistogram(desc, count, sum, buckets)`. `scrapeErrors` is the only persistent in-memory value and is a monotonic counter by design.
 
 **Metric inventory:**
 
 | Metric | Type | Labels | SQL Query |
 |---|---|---|---|
-| `supervisor_spawns_last_30d` | Gauge | `phase` | `SELECT phase, COUNT(*) FROM turn_usage GROUP BY phase` |
-| `supervisor_tokens_last_30d` | Gauge | `kind` (input/output/cache_read/cache_creation) | `SELECT SUM(input_tokens), SUM(output_tokens), SUM(cache_read_tokens), SUM(cache_creation_tokens) FROM turn_usage` |
+| `supervisor_spawns_last_30d` | Gauge | `phase` | `SELECT phase, COUNT(*) FROM turn_usage WHERE created_at > (strftime('%s','now','-30 days') * 1000) GROUP BY phase` |
+| `supervisor_tokens_last_30d` | Gauge | `kind` (input/output/cache_read/cache_creation) | `SELECT SUM(input_tokens), SUM(output_tokens), SUM(cache_read_tokens), SUM(cache_creation_tokens) FROM turn_usage WHERE created_at > (strftime('%s','now','-30 days') * 1000)` |
 | `supervisor_dlq_size` | Gauge | — | `SELECT COUNT(*) FROM dlq` |
 | `supervisor_inbox_backlog` | Gauge | — | `SELECT COUNT(*) FROM inbox WHERE processed_at IS NULL` |
-| `supervisor_spawn_duration_seconds` | Histogram | `phase` | `SELECT phase, spawn_duration_ms FROM turn_usage WHERE created_at > now-1h` (ingested each scrape) |
-| `supervisor_metrics_scrape_errors_total` | Counter | — | In-memory, incremented on query failure |
+| `supervisor_spawn_duration_seconds` | Histogram | `phase` | Bucket-aggregate SQL (see Histogram note below); `WHERE spawn_duration_ms IS NOT NULL AND created_at > now - 1h` |
+| `supervisor_metrics_scrape_errors_total` | Counter | `query` (spawns/tokens/dlq/inbox_backlog/spawn_duration/panic) | In-memory, incremented per query on failure |
 
-**Histogram note:** `spawn_duration_seconds` buckets = `[5, 10, 30, 60, 120, 300]` seconds. Populated from `turn_usage.spawn_duration_ms` rows inserted in the last 1 hour. Because we're not Prometheus-native, we re-observe all recent durations every scrape — idempotent since the histogram is rebuilt from a fresh `Collector` snapshot per request.
+**Histogram note:** `spawn_duration_seconds` buckets = `[5, 10, 30, 60, 120, 300]` seconds. Computed each `Collect()` call from `turn_usage.spawn_duration_ms` rows inserted in the last 1 hour. Implementation uses `prometheus.MustNewConstHistogram(desc, sampleCount, sampleSum, bucketCountsMap)` — bucket counts are derived in a single SQL query (`SELECT CASE WHEN spawn_duration_ms < 5000 THEN '5' ... END bucket, COUNT(*), SUM(spawn_duration_ms) FROM turn_usage WHERE spawn_duration_ms IS NOT NULL AND created_at > now - 1h GROUP BY bucket`). No Go-level histogram state accumulates; each scrape reflects the same 1h window.
 
 **Naming rationale (`_last_30d` over `_total`):** The `usage_gc` cron deletes `turn_usage` rows older than 30 days at 03:00 WIB. If we named these `_total` and backed them with `COUNT(*)`, the post-GC drop would look like a counter reset to Prometheus/Cloud Monitoring, creating false spikes in `rate()`/`increase()` calculations. Gauge naming is honest.
 
@@ -202,13 +214,20 @@ Apply: `gcloud monitoring dashboards create --config-from-file=infra/cloud-monit
 
 ## Error handling
 
+**Partial-failure rule** (authoritative): each SQL aggregate runs independently. On individual failure (timeout or error), `scrape_errors_total` is incremented (labeled with the query name), that metric family is **omitted** from the scrape output, and Collect proceeds to the next query. HTTP status depends on whether ANY metric family succeeded:
+
+- **At least one family succeeded** → `200 OK` with the succeeded families only (promhttp default behavior)
+- **All families failed** → Collector emits only `scrape_errors_total` + sets a response header `X-Scrape-Status: all-failed`; the handler wrapper inspects the Registry's output and returns **503** when no `supervisor_*` business metric was emitted
+- **Handler panic** → recovered by `promhttp` middleware; `scrape_errors_total++`; returns 500
+
 | Failure | Response |
 |---|---|
-| DB query timeout (2s) via `context.WithTimeout` | Increment `scrape_errors_total`, return HTTP 503, log once per 60s |
-| SQL query error | Wrap with `fmt.Errorf("metrics: %s: %w", queryName, err)`, emit other metrics normally if possible |
-| HTTP bind failure at startup | Log `[metrics] bind %s: %v` and exit — misconfig should surface immediately, not ship silently |
-| Collector panic | Recovered by `promhttp` middleware; `scrape_errors_total++`; supervisor unaffected |
-| Missing `METRICS_ADDR` | Use default `127.0.0.1:9090`; empty string explicitly disables metrics |
+| DB query timeout (2s via `context.WithTimeout`) | `scrape_errors_total{query="spawns"}++`, omit that family, continue (per partial-failure rule) |
+| Individual SQL query error | Wrap with `fmt.Errorf("metrics: %s: %w", queryName, err)`, log once per 60s per query, `scrape_errors_total{query=...}++`, omit that family |
+| ALL queries fail in one scrape | 503 response, all families absent, only `scrape_errors_total` visible |
+| HTTP bind failure at startup | Log `[metrics] bind %s: %v` and **exit** — misconfig should surface immediately |
+| Collector `Collect()` panic | Recovered by promhttp; `scrape_errors_total{query="panic"}++`; returns 500 |
+| `METRICS_ADDR` unset | Default `127.0.0.1:9090`; empty string explicitly disables metrics goroutine |
 
 ## Testing strategy
 
@@ -277,7 +296,7 @@ curl -s http://localhost:9090/metrics | head -30
 | DB scrape contention under N=4 concurrent spawns | 2s query timeout + scrape_errors counter + 60s scrape interval. Tiny DB means queries are sub-ms even with contention. |
 | Cardinality explosion from a future label change | Code review rule: never add `task_id` or `comment_id` as labels. Enforced by spec + grep-guard in CI (future). |
 | Ops Agent misconfig on VM | Fragment file is git-tracked; config.yaml.prev backup during rollout; journalctl smoke test after restart. |
-| Histogram re-observation on every scrape inflates counts | Histograms are reset per-Collect() via fresh `prometheus.Registry` to avoid double-counting. Tested in metrics_test.go #5. |
+| Histogram re-observation on every scrape inflates counts | `prometheus.MustNewConstHistogram` pattern: bucket counts derived from SQL per `Collect()`, no accumulated Go-level state. Tested in metrics_test.go #5. |
 
 ## Implementation scope summary
 
