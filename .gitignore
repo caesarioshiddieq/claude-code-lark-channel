@@ -1,3 +1,5 @@
 node_modules/
 .env
 infra/claude-vm-supervisor
+coverage.out
+/supervisor

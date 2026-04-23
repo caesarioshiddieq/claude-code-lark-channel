@@ -2,7 +2,10 @@ module github.com/caesarioshiddieq/claude-code-lark-channel
 
 go 1.26.2
 
-require modernc.org/sqlite v1.49.1
+require (
+	go.uber.org/goleak v1.3.0
+	modernc.org/sqlite v1.49.1
+)
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
