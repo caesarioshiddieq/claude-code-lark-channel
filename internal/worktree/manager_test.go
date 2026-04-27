@@ -131,8 +131,17 @@ func TestGarbageCollect_RemovesStaleDirs(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Backdate stalePath AND every child recursively. GC walks children
+	// for newest mtime (P1 fix), so backdating only the parent leaves
+	// fresh children that vote "preserve."
 	old := time.Now().Add(-48 * time.Hour)
-	if err := os.Chtimes(stalePath, old, old); err != nil {
+	if err := filepath.Walk(stalePath, func(path string, _ os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		_ = os.Chtimes(path, old, old)
+		return nil
+	}); err != nil {
 		t.Fatal(err)
 	}
 
