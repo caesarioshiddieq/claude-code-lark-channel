@@ -85,7 +85,7 @@ func TestImplementerRun_RoundTrip(t *testing.T) {
 		TaskID:         "task-impl-1",
 		StartedAt:      started,
 		WorktreePath:   "/var/lib/claude-vm/worktrees/task-impl-1",
-		BranchName:     "feat/impl-task-impl-1",
+		BranchName:     "implement/task-impl-1-deadbeef",
 	}
 
 	id, err := db.InsertImplementerRun(ctx, run)
@@ -118,7 +118,7 @@ func TestImplementerRun_RoundTrip(t *testing.T) {
 	if got.WorktreePath != "/var/lib/claude-vm/worktrees/task-impl-1" {
 		t.Errorf("WorktreePath: got %q", got.WorktreePath)
 	}
-	if got.BranchName != "feat/impl-task-impl-1" {
+	if got.BranchName != "implement/task-impl-1-deadbeef" {
 		t.Errorf("BranchName: got %q", got.BranchName)
 	}
 	if got.Outcome != "" {
