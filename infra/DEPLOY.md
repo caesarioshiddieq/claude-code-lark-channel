@@ -56,6 +56,14 @@ sudo systemctl start claude-vm
 journalctl -u claude-vm -f
 ```
 
+## 4b. Headroom Check (read-only)
+
+```bash
+bash infra/headroom-check.sh
+```
+
+Runs SQLite read-only queries (`PRAGMA query_only=1`) against `/var/lib/claude-vm/queue.db` plus a memory snapshot. Use before bumping `MAX_CONCURRENT_SPAWNS_GLOBAL`. The script's tail prints a GO/HOLD cheatsheet against thresholds for spawn rate, per-task pending, backlog age, DLQ growth, and child-process RSS.
+
 ## 5. Verification Scenarios
 
 Run these against a live deployment to confirm correct end-to-end behaviour.
