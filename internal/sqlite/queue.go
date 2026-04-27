@@ -52,6 +52,26 @@ var migration0003 = []string{
 	`ALTER TABLE inbox ADD COLUMN compact_entered_at INTEGER`,
 }
 
+var migration0004 = []string{
+	`CREATE TABLE IF NOT EXISTS implementer_runs (
+		id                INTEGER PRIMARY KEY AUTOINCREMENT,
+		inbox_comment_id  TEXT    NOT NULL,
+		task_id           TEXT    NOT NULL,
+		started_at        INTEGER NOT NULL,
+		finished_at       INTEGER,
+		outcome           TEXT    NOT NULL DEFAULT '',
+		gnhf_iterations   INTEGER NOT NULL DEFAULT 0,
+		gnhf_commits_made INTEGER NOT NULL DEFAULT 0,
+		tokens_used       INTEGER NOT NULL DEFAULT 0,
+		worktree_path     TEXT    NOT NULL DEFAULT '',
+		branch_name       TEXT    NOT NULL DEFAULT '',
+		pr_url            TEXT    NOT NULL DEFAULT '',
+		notes_md_excerpt  TEXT    NOT NULL DEFAULT '',
+		error             TEXT    NOT NULL DEFAULT ''
+	)`,
+	`CREATE INDEX IF NOT EXISTS implementer_runs_comment_idx ON implementer_runs(inbox_comment_id)`,
+}
+
 func migrate(db *sql.DB) error {
 	if _, err := db.Exec(createMigrations); err != nil {
 		return fmt.Errorf("create migrations table: %w", err)
@@ -62,6 +82,7 @@ func migrate(db *sql.DB) error {
 	}{
 		{2, migration0002},
 		{3, migration0003},
+		{4, migration0004},
 	}
 	for _, m := range migrations {
 		var count int
