@@ -12,7 +12,6 @@ import (
 
 	"github.com/caesarioshiddieq/claude-code-lark-channel/internal/budget"
 	"github.com/caesarioshiddieq/claude-code-lark-channel/internal/sqlite"
-	"github.com/caesarioshiddieq/claude-code-lark-channel/internal/worker"
 )
 
 // DBClient is the narrow interface DispatchImplement needs from *sqlite.DB.
@@ -124,24 +123,30 @@ func tryOpenPR(ctx context.Context, outcome, branchName, prompt string) string {
 }
 
 // DispatchImplement executes the full autonomous-implementer flow for a single
-// inbox row with phase="implement". Safe to call from any goroutine and any
-// entry point — the budget gate is re-checked internally for defence-in-depth.
+// inbox row with phase="implement".
+//
+// LOCK CONTRACT: the caller MUST hold the per-task flock (worker.LockTask) for
+// row.TaskID before calling. This function does NOT acquire the lock. Rationale:
+// a release/reacquire handoff (where processOne unlocks before DispatchImplement
+// re-locks) leaves a window in which another supervisor process could pick up
+// the same comment and double-run. Holding the outer lock through dispatch
+// closes that window. See cmd/supervisor/main.go's processOne for the canonical
+// caller pattern.
 //
 // Flow:
 //  1. Budget gate (CanSpawn) — defer on rejection.
-//  2. Per-task flock (LockTask / UnlockTask).
-//  3. Worktree ensure (EnsureForTask).
-//  4. Insert implementer_runs row (started_at only).
-//  5. Spawn gnhf subprocess.
-//  6. Finalize run row (all gnhf_* + derived outcome + tokens_used).
-//  7. Auto-PR (env-gated, OFF by default for MVP).
-//  8. Outbox row (phase="implement").
-//  9. Cleanup worktree (preserve if CommitCount>0, remove otherwise).
-//  10. MarkInboxProcessed.
+//  2. Worktree ensure (EnsureForTask).
+//  3. Insert implementer_runs row (started_at only).
+//  4. Spawn gnhf subprocess.
+//  5. Finalize run row (all gnhf_* + derived outcome + tokens_used + finished_at).
+//  6. Auto-PR (env-gated, OFF by default for MVP).
+//  7. Outbox row + inline Lark post (phase="implement").
+//  8. Cleanup worktree (preserve if CommitCount>0, remove otherwise).
+//  9. MarkInboxProcessed.
 //
 // Returns nil in all handled cases including ErrIncompleteLog. Non-nil only
-// for unexpected errors (LockTask failure, EnsureForTask failure) that the
-// caller should log and may choose to defer/retry.
+// for unexpected errors (EnsureForTask, InsertImplementerRun) that the caller
+// should log and may choose to defer/retry.
 func DispatchImplement(ctx context.Context, row sqlite.InboxRow, deps Deps) error {
 	now := deps.Now()
 
@@ -155,24 +160,17 @@ func DispatchImplement(ctx context.Context, row sqlite.InboxRow, deps Deps) erro
 		return nil
 	}
 
-	// Step 2: Per-task flock.
-	lockFile, err := worker.LockTask(row.TaskID)
-	if err != nil {
-		log.Printf("dispatchImplement: LockTask %s: %v", row.TaskID, err)
-		return fmt.Errorf("dispatchImplement: LockTask: %w", err)
-	}
-	defer worker.UnlockTask(lockFile)
-
-	// Step 3: Worktree.
+	// Step 2: Worktree.
 	wtPath, branchName, err := deps.Worktree.EnsureForTask(ctx, row.TaskID)
 	if err != nil {
 		log.Printf("dispatchImplement: EnsureForTask %s: %v", row.TaskID, err)
 		return fmt.Errorf("dispatchImplement: EnsureForTask: %w", err)
 	}
 
-	// Step 4: Insert run row (start marker only; finalized after spawn).
-	// Reuse the captured `now` rather than calling deps.Now() again — keeps
-	// timestamps consistent and avoids advancing a synthetic test clock twice.
+	// Step 3: Insert run row (start marker only; finalized after spawn).
+	// Reuse the captured `now` for started_at — this records WHEN dispatch began,
+	// before the spawn-elapsed time is added. finished_at uses a FRESH deps.Now()
+	// after Spawn returns, so the duration (finished_at - started_at) is correct.
 	runID, err := deps.DB.InsertImplementerRun(ctx, sqlite.ImplementerRun{
 		InboxCommentID: row.CommentID,
 		TaskID:         row.TaskID,
@@ -198,10 +196,10 @@ func DispatchImplement(ctx context.Context, row sqlite.InboxRow, deps Deps) erro
 	spawnMaxIterations := args.MaxIterations
 	spawnMaxTokens := args.MaxTokens // 0 = unbounded (no allowance line)
 
-	// Step 5: Spawn gnhf subprocess.
+	// Step 4: Spawn gnhf subprocess.
 	result, spawnErr := deps.Spawn(ctx, args)
 
-	// Step 6: Derive outcome and finalize run row.
+	// Step 5: Derive outcome and finalize run row.
 	// For ErrIncompleteLog/*ErrAmbiguousRunDir the result is a usable synthesized
 	// struct — we always persist it. spawnErr only drives errStr / outcome override.
 	outcome := deriveOutcome(result)
@@ -235,18 +233,19 @@ func DispatchImplement(ctx context.Context, row sqlite.InboxRow, deps Deps) erro
 		Error:            errStr,
 	}
 
-	// Step 7: Auto-PR (env-gated OFF by default for MVP).
+	// Step 6: Auto-PR (env-gated OFF by default for MVP).
 	prURL := ""
 	if result.CommitCount > 0 {
 		prURL = tryOpenPR(ctx, outcome, branchName, row.Content)
 	}
 	fin.PRURL = prURL
 
-	// Inject the finalize timestamp from the dispatcher's clock so it stays
-	// consistent with started_at and tests can assert determinism.
-	// finished_at is in milliseconds to match migration0004's contract;
-	// started_at uses Unix() — known schema quirk inherited from Task 1.
-	fin.FinishedAt = now.UnixMilli()
+	// Inject the finalize timestamp from a FRESH deps.Now() call — NOT the
+	// captured `now` at function entry. Spawn can run for minutes/hours; reusing
+	// `now` would record finished_at == started_at and lose the elapsed duration.
+	// Schema quirk inherited from migration0004: started_at uses Unix() (seconds),
+	// finished_at uses UnixMilli() (milliseconds).
+	fin.FinishedAt = deps.Now().UnixMilli()
 
 	if err := deps.DB.FinalizeImplementerRun(ctx, runID, fin); err != nil {
 		// On finalize failure, surface pr_url in the log line if we managed to
@@ -261,7 +260,7 @@ func DispatchImplement(ctx context.Context, row sqlite.InboxRow, deps Deps) erro
 		// Non-fatal: continue so outbox and cleanup still execute.
 	}
 
-	// Step 8: Outbox row + inline Lark post.
+	// Step 7: Outbox row + inline Lark post.
 	// OutboxInsertPhased records a (comment_id, phase="implement") dedup key.
 	// When inserted=true (first time), we immediately post the formatted summary
 	// to Lark — mirroring the dispatchNormal pattern (main.go:312-321).
@@ -284,14 +283,14 @@ func DispatchImplement(ctx context.Context, row sqlite.InboxRow, deps Deps) erro
 		}
 	}
 
-	// Step 9: Cleanup worktree.
+	// Step 8: Cleanup worktree.
 	// Preserve when commits were made; remove otherwise (avoids unbounded disk growth).
 	cleanupSuccess := result.CommitCount > 0
 	if err := deps.Worktree.Cleanup(ctx, row.TaskID, cleanupSuccess); err != nil {
 		log.Printf("dispatchImplement: Cleanup %s: %v", row.TaskID, err)
 	}
 
-	// Step 10: MarkInboxProcessed.
+	// Step 9: MarkInboxProcessed.
 	if err := deps.DB.MarkInboxProcessed(ctx, row.CommentID); err != nil {
 		log.Printf("dispatchImplement: MarkInboxProcessed %s: %v", row.CommentID, err)
 	}
