@@ -37,15 +37,23 @@ type WorktreeClient interface {
 // In production this is SpawnGnhf; in tests it is a fake.
 type SpawnFunc func(ctx context.Context, args GnhfArgs) (GnhfResult, error)
 
+// LarkClient is the narrow interface DispatchImplement needs to post a
+// formatted summary comment back to the Lark task thread.
+// Defined here (interface-where-used) — *lark.Client satisfies it.
+type LarkClient interface {
+	PostComment(ctx context.Context, taskID, content, replyToCommentID string) (string, error)
+}
+
 // Deps holds all external dependencies for DispatchImplement, injected at
 // call time to allow test substitution without a global registry.
 type Deps struct {
-	DB        DBClient
-	Worktree  WorktreeClient
-	Spawn     SpawnFunc
-	RepoPath  string // canonical managed-repo path on disk
-	Now       func() time.Time
-	JitterMin int
+	DB         DBClient
+	Worktree   WorktreeClient
+	Spawn      SpawnFunc
+	LarkClient LarkClient // nil → skip inline post (backward-compat with existing tests)
+	RepoPath   string     // canonical managed-repo path on disk
+	Now        func() time.Time
+	JitterMin  int
 }
 
 // deriveOutcome maps a GnhfResult to the legacy outcome string per the
@@ -177,11 +185,20 @@ func DispatchImplement(ctx context.Context, row sqlite.InboxRow, deps Deps) erro
 		return fmt.Errorf("dispatchImplement: InsertImplementerRun: %w", err)
 	}
 
+	// Capture ceiling values before Spawn so we can pass identical knobs to
+	// FormatImplementerSummary after the run completes. applyDefaults fills any
+	// zero field, so we mirror its logic here to get the resolved values without
+	// a second call. MaxTokens=0 means unbounded (omit --max-tokens flag).
+	spawnMaxIterations := defaultMaxIterations
+	var spawnMaxTokens int64 // 0 = unbounded
+
 	// Step 5: Spawn gnhf subprocess.
 	result, spawnErr := deps.Spawn(ctx, GnhfArgs{
 		Prompt:         row.Content,
 		WorktreePath:   wtPath,
 		ExpectedBranch: branchName,
+		MaxIterations:  spawnMaxIterations,
+		MaxTokens:      spawnMaxTokens,
 	})
 
 	// Step 6: Derive outcome and finalize run row.
@@ -242,11 +259,13 @@ func DispatchImplement(ctx context.Context, row sqlite.InboxRow, deps Deps) erro
 		// Non-fatal: continue so outbox and cleanup still execute.
 	}
 
-	// Step 8: Outbox row — phased intent marker only, NOT a payload store.
-	// The outbox table has no content column; it's a (comment_id, phase) dedup
-	// key so OutboxFlush knows a reply is owed. Task 6 composes the actual
-	// Lark reply body at flush time by reading implementer_runs via
-	// GetImplementerRunByCommentID.
+	// Step 8: Outbox row + inline Lark post.
+	// OutboxInsertPhased records a (comment_id, phase="implement") dedup key.
+	// When inserted=true (first time), we immediately post the formatted summary
+	// to Lark — mirroring the dispatchNormal pattern (main.go:312-321).
+	// On inserted=false (idempotent re-run after crash), skip the post — a prior
+	// run either posted already or the outbox row serves as the record.
+	// On PostComment failure: log + continue (outbox row stays; operator can replay).
 	inserted, outboxErr := deps.DB.OutboxInsertPhased(ctx, row.CommentID, row.TaskID, row.CommentID, "implement")
 	if outboxErr != nil {
 		log.Printf("dispatchImplement: OutboxInsertPhased %s: %v", row.CommentID, outboxErr)
@@ -254,6 +273,13 @@ func DispatchImplement(ctx context.Context, row sqlite.InboxRow, deps Deps) erro
 		// Existing row → idempotent re-run after crash recovery. Operators
 		// looking at duplicate processing should see this signal in the logs.
 		log.Printf("dispatchImplement: outbox marker already existed for %s (idempotent re-run)", row.CommentID)
+	}
+	if inserted && deps.LarkClient != nil {
+		msg := FormatImplementerSummary(result, branchName, prURL, spawnMaxIterations, spawnMaxTokens)
+		if _, postErr := deps.LarkClient.PostComment(ctx, row.TaskID, msg, row.CommentID); postErr != nil {
+			log.Printf("dispatchImplement: PostComment %s: %v", row.CommentID, postErr)
+			// Non-fatal: outbox row remains as the record; operator can replay.
+		}
 	}
 
 	// Step 9: Cleanup worktree.

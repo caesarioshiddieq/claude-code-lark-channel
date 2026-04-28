@@ -252,12 +252,13 @@ func processOne(ctx context.Context, db *sqlite.DB, client *lark.Client, maxTurn
 		lockFile = nil // prevent the deferred UnlockTask from double-releasing
 		repoPath := os.Getenv("IMPLEMENTER_DEFAULT_REPO")
 		deps := implementer.Deps{
-			DB:        db,
-			Worktree:  worktree.New(repoPath, ""),
-			Spawn:     implementer.SpawnGnhf,
-			RepoPath:  repoPath,
-			Now:       time.Now,
-			JitterMin: getJitterMinutes(),
+			DB:         db,
+			Worktree:   worktree.New(repoPath, ""),
+			Spawn:      implementer.SpawnGnhf,
+			LarkClient: client,
+			RepoPath:   repoPath,
+			Now:        time.Now,
+			JitterMin:  getJitterMinutes(),
 		}
 		if err := implementer.DispatchImplement(ctx, row, deps); err != nil {
 			log.Printf("dispatchImplement %s: %v", row.CommentID, err)
