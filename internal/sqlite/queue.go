@@ -233,9 +233,10 @@ func (d *DB) NextInboxRow(ctx context.Context) (InboxRow, bool, error) {
 		  AND (scheduled_for IS NULL OR scheduled_for <= ?)
 		ORDER BY
 		  CASE phase
-		    WHEN 'answer'  THEN 1
-		    WHEN 'compact' THEN 2
-		    ELSE               3
+		    WHEN 'answer'    THEN 1
+		    WHEN 'compact'   THEN 2
+		    WHEN 'implement' THEN 3
+		    ELSE                  4
 		  END,
 		  created_at ASC
 		LIMIT 1`
@@ -273,9 +274,10 @@ func (d *DB) NextInboxRowExcluding(ctx context.Context, busyTaskIDs []string) (I
 		  AND task_id NOT IN (` + strings.Join(placeholders, ",") + `)
 		ORDER BY
 		  CASE phase
-		    WHEN 'answer'  THEN 1
-		    WHEN 'compact' THEN 2
-		    ELSE               3
+		    WHEN 'answer'    THEN 1
+		    WHEN 'compact'   THEN 2
+		    WHEN 'implement' THEN 3
+		    ELSE                  4
 		  END,
 		  created_at ASC
 		LIMIT 1`
