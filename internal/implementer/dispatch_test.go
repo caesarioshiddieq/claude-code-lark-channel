@@ -26,6 +26,12 @@ type fakeDB struct {
 	finalizedRuns  map[int64]sqlite.ImplementerRunFinalize
 	outboxRows     []outboxRow
 
+	// Idempotency-guard support (codex round-2 #1).
+	// Tests seed seedImplementerRun to exercise crash-recovery cases B/C.
+	// lookupErr forces GetImplementerRunByCommentID to fail (operator pager path).
+	seedImplementerRun *sqlite.ImplementerRun
+	lookupErr          error
+
 	insertRunErr    error
 	markDeferredErr error
 }
@@ -85,6 +91,18 @@ func (f *fakeDB) OutboxInsertPhased(ctx context.Context, commentID, taskID, repl
 	defer f.mu.Unlock()
 	f.outboxRows = append(f.outboxRows, outboxRow{commentID, taskID, replyTo, phase})
 	return true, nil
+}
+
+func (f *fakeDB) GetImplementerRunByCommentID(ctx context.Context, commentID string) (sqlite.ImplementerRun, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.lookupErr != nil {
+		return sqlite.ImplementerRun{}, false, f.lookupErr
+	}
+	if f.seedImplementerRun != nil && f.seedImplementerRun.InboxCommentID == commentID {
+		return *f.seedImplementerRun, true, nil
+	}
+	return sqlite.ImplementerRun{}, false, nil
 }
 
 // fakeWorktree records calls and returns configured path/branch.
@@ -741,5 +759,184 @@ func TestDispatchImplement_FinishedAtAfterStartedAt(t *testing.T) {
 	if finishedAt <= startedAtMs {
 		t.Errorf("finished_at must be after started_at: started_at=%d s (%d ms), finished_at=%d ms — same `now` reused?",
 			startedAt, startedAtMs, finishedAt)
+	}
+}
+
+// TestDispatchImplement_RecoverFromCompletedCrash verifies case B of the
+// idempotency guard (codex round-2 #1): when a prior implementer_runs row
+// is finalized (finished_at != nil) but the supervisor crashed before
+// MarkInboxProcessed, the dispatcher must skip respawn, reformat-and-repost
+// from the persisted telemetry, and mark the inbox row processed.
+func TestDispatchImplement_RecoverFromCompletedCrash(t *testing.T) {
+	nightEnvOn(t)
+
+	db := newFakeDB()
+	finishedAt := int64(1746000000000) // arbitrary finalized timestamp (ms)
+	db.seedImplementerRun = &sqlite.ImplementerRun{
+		ID:               42,
+		InboxCommentID:   "c-recoverB",
+		TaskID:           "task-recoverB",
+		StartedAt:        1746000000,
+		FinishedAt:       &finishedAt,
+		Outcome:          "success",
+		BranchName:       "implement/task-recoverB-aabb",
+		PRURL:            "https://github.com/example/repo/pull/77",
+		NotesMDExcerpt:   "all good",
+		GnhfStatus:       "stopped",
+		GnhfReason:       "stop_when",
+		GnhfIterations:   4,
+		GnhfCommitsMade:  2,
+		GnhfSuccessCount: 4,
+		GnhfFailCount:    0,
+		GnhfInputTokens:  300,
+		GnhfOutputTokens: 150,
+		GnhfRunID:        "run-recovered-b",
+		GnhfNoProgress:   false,
+		GnhfLastMessage:  "stop condition met",
+	}
+
+	wt := &fakeWorktree{ensurePath: "/wt/should-not-be-called", ensureBranch: "should/not"}
+	lc := &fakeLarkClient{}
+
+	spawnCalled := false
+	deps := implementer.Deps{
+		DB:       db,
+		Worktree: wt,
+		Spawn: func(ctx context.Context, args implementer.GnhfArgs) (implementer.GnhfResult, error) {
+			spawnCalled = true
+			return implementer.GnhfResult{}, nil
+		},
+		LarkClient: lc,
+		RepoPath:   "/repo",
+		Now:        time.Now,
+		JitterMin:  0,
+	}
+	row := makeRow("c-recoverB", "task-recoverB", "impl recoverB task", "autonomous")
+
+	if err := implementer.DispatchImplement(context.Background(), row, deps); err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+
+	// Spawn must NOT have been called — recovery, not respawn.
+	if spawnCalled {
+		t.Error("Spawn must not be called when prior finalized row exists (case B)")
+	}
+	// No new run row inserted.
+	if len(db.insertedRuns) != 0 {
+		t.Errorf("expected 0 InsertImplementerRun calls (recovery skips insert), got %d",
+			len(db.insertedRuns))
+	}
+	// No new finalize either — the existing row stays.
+	if len(db.finalizedRuns) != 0 {
+		t.Errorf("expected 0 FinalizeImplementerRun calls (case B does not re-finalize), got %d",
+			len(db.finalizedRuns))
+	}
+	// Worktree.EnsureForTask was NOT called — recovery skips worktree work.
+	// (We can't easily assert this without instrumenting fakeWorktree; the
+	// "should-not-be-called" path is the smoke test — if EnsureForTask had
+	// been called, the dispatcher would have advanced into the spawn path.)
+
+	// Outbox + Lark post + MarkInboxProcessed must have happened.
+	assertOutboxMarker(t, db, row)
+	if len(db.processedCalls) != 1 {
+		t.Errorf("expected MarkInboxProcessed called once, got %d", len(db.processedCalls))
+	}
+
+	lc.mu.Lock()
+	calls := lc.calls
+	lc.mu.Unlock()
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 PostComment call, got %d", len(calls))
+	}
+	// Verify the message reflects the persisted (success/stop_when) result.
+	if !strings.Contains(calls[0].Content, "finished — stop-when condition met") {
+		t.Errorf("PostComment content missing recovered headline, got: %q", calls[0].Content)
+	}
+	// PR URL from the persisted row should be present.
+	if !strings.Contains(calls[0].Content, "https://github.com/example/repo/pull/77") {
+		t.Errorf("PostComment content missing recovered PR URL, got: %q", calls[0].Content)
+	}
+}
+
+// TestDispatchImplement_RecoverFromInterruptedCrash verifies case C of the
+// idempotency guard: a prior row started but never finalized (finished_at
+// == nil). The dispatcher must NOT respawn (worktree may be partial),
+// must finalize the EXISTING row with a synthetic failure outcome, post a
+// "supervisor crashed" summary, and mark the inbox processed.
+func TestDispatchImplement_RecoverFromInterruptedCrash(t *testing.T) {
+	nightEnvOn(t)
+
+	db := newFakeDB()
+	db.seedImplementerRun = &sqlite.ImplementerRun{
+		ID:             99,
+		InboxCommentID: "c-recoverC",
+		TaskID:         "task-recoverC",
+		StartedAt:      1746000000,
+		FinishedAt:     nil, // interrupted — never finalized
+		BranchName:     "implement/task-recoverC-aabb",
+	}
+
+	wt := &fakeWorktree{ensurePath: "/wt/should-not-be-called", ensureBranch: "should/not"}
+	lc := &fakeLarkClient{}
+
+	spawnCalled := false
+	deps := implementer.Deps{
+		DB:       db,
+		Worktree: wt,
+		Spawn: func(ctx context.Context, args implementer.GnhfArgs) (implementer.GnhfResult, error) {
+			spawnCalled = true
+			return implementer.GnhfResult{}, nil
+		},
+		LarkClient: lc,
+		RepoPath:   "/repo",
+		Now:        time.Now,
+		JitterMin:  0,
+	}
+	row := makeRow("c-recoverC", "task-recoverC", "impl recoverC task", "autonomous")
+
+	if err := implementer.DispatchImplement(context.Background(), row, deps); err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+
+	if spawnCalled {
+		t.Error("Spawn must not be called when prior interrupted row exists (case C)")
+	}
+	// Recovery finalizes the EXISTING row (id=99), no new insert.
+	if len(db.insertedRuns) != 0 {
+		t.Errorf("expected 0 InsertImplementerRun calls in case C, got %d", len(db.insertedRuns))
+	}
+	fin, ok := db.finalizedRuns[99]
+	if !ok {
+		t.Fatalf("expected case-C finalize on existing run id=99, got finalizedRuns=%v", db.finalizedRuns)
+	}
+	if fin.Outcome != "failed" {
+		t.Errorf("case C outcome: got %q want failed", fin.Outcome)
+	}
+	if !strings.Contains(fin.Error, "supervisor crashed") {
+		t.Errorf("case C error must mention supervisor crash, got %q", fin.Error)
+	}
+	if fin.GnhfStatus != "aborted" {
+		t.Errorf("case C gnhf_status: got %q want aborted", fin.GnhfStatus)
+	}
+	if fin.FinishedAt == 0 {
+		t.Error("case C finished_at must be set by recovery path")
+	}
+
+	assertOutboxMarker(t, db, row)
+	if len(db.processedCalls) != 1 {
+		t.Errorf("expected MarkInboxProcessed called once, got %d", len(db.processedCalls))
+	}
+
+	lc.mu.Lock()
+	calls := lc.calls
+	lc.mu.Unlock()
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 PostComment call, got %d", len(calls))
+	}
+	if !strings.Contains(calls[0].Content, "aborted — see notes for context") {
+		t.Errorf("case C summary should reflect aborted/unknown headline, got: %q", calls[0].Content)
+	}
+	if !strings.Contains(calls[0].Content, "log incomplete") {
+		t.Errorf("case C summary should include log-incomplete suffix, got: %q", calls[0].Content)
 	}
 }

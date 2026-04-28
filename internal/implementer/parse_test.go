@@ -209,3 +209,32 @@ func TestNoProgress_SuccessCountNonZeroButCommitZero(t *testing.T) {
 		t.Error("NoProgress: want true when commitCount=0 regardless of successCount")
 	}
 }
+
+// TestParseGnhfLog_LongLastMessage verifies that a run:complete line larger
+// than the default bufio.Scanner buffer (64KB) is parsed correctly without
+// being silently truncated into ErrIncompleteLog (codex round-2 #2). The
+// fix sets scanner.Buffer(1MB, 16MB) — this test pushes well above 64KB.
+func TestParseGnhfLog_LongLastMessage(t *testing.T) {
+	// 100 KB of repeated text — well above the 64KB default Scanner limit
+	// but well below the 16MB ceiling we configured. Use a non-special
+	// character so the JSON encoding stays simple (no escaping cost).
+	const size = 100 * 1024
+	long := make([]byte, size)
+	for i := range long {
+		long[i] = 'x'
+	}
+	jsonl := makeRunComplete("stopped", string(long), 7, 5, 0, 3, 2000, 1000)
+
+	r, err := implementer.ParseGnhfLog([]byte(jsonl))
+	if err != nil {
+		t.Fatalf("expected successful parse of 100KB lastMessage line, got err: %v", err)
+	}
+	if len(r.LastMessage) != size {
+		t.Errorf("LastMessage length: got %d, want %d (parser truncated long line?)",
+			len(r.LastMessage), size)
+	}
+	if r.Iterations != 7 || r.CommitCount != 3 {
+		t.Errorf("metadata fields lost across long line: iterations=%d commits=%d",
+			r.Iterations, r.CommitCount)
+	}
+}

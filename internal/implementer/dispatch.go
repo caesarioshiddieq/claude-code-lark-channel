@@ -23,6 +23,7 @@ type DBClient interface {
 	InsertImplementerRun(ctx context.Context, r sqlite.ImplementerRun) (int64, error)
 	FinalizeImplementerRun(ctx context.Context, id int64, fin sqlite.ImplementerRunFinalize) error
 	OutboxInsertPhased(ctx context.Context, commentID, taskID, replyTo, phase string) (bool, error)
+	GetImplementerRunByCommentID(ctx context.Context, commentID string) (sqlite.ImplementerRun, bool, error)
 }
 
 // WorktreeClient is the narrow interface DispatchImplement needs from *worktree.Manager.
@@ -122,6 +123,59 @@ func tryOpenPR(ctx context.Context, outcome, branchName, prompt string) string {
 	return strings.TrimSpace(out.String())
 }
 
+// resultFromImplementerRun reconstructs a GnhfResult from a persisted
+// implementer_runs row. Used for crash-recovery (case B): the prior run
+// completed and finalized but we crashed before MarkInboxProcessed, so we
+// re-format and re-post from the persisted telemetry without respawning gnhf.
+func resultFromImplementerRun(r sqlite.ImplementerRun) GnhfResult {
+	return GnhfResult{
+		Status:        Status(r.GnhfStatus),
+		Reason:        Reason(r.GnhfReason),
+		Iterations:    r.GnhfIterations,
+		SuccessCount:  r.GnhfSuccessCount,
+		FailCount:     r.GnhfFailCount,
+		CommitCount:   r.GnhfCommitsMade,
+		InputTokens:   r.GnhfInputTokens,
+		OutputTokens:  r.GnhfOutputTokens,
+		RunID:         r.GnhfRunID,
+		NotesExcerpt:  r.NotesMDExcerpt,
+		LastMessage:   r.GnhfLastMessage,
+		NoProgress:    r.GnhfNoProgress,
+		LogIncomplete: false, // we have a finalized row, log was complete
+	}
+}
+
+// postSummaryAndMarkProcessed handles the tail of all DispatchImplement paths
+// (normal completion, case B recovery, case C recovery): insert the outbox
+// marker, post the formatted summary to Lark when newly inserted, and finally
+// MarkInboxProcessed. All errors are logged; none propagate.
+func postSummaryAndMarkProcessed(
+	ctx context.Context,
+	deps Deps,
+	row sqlite.InboxRow,
+	result GnhfResult,
+	branchName, prURL string,
+	maxIterations int,
+	maxTokens int64,
+) {
+	inserted, outboxErr := deps.DB.OutboxInsertPhased(ctx, row.CommentID, row.TaskID, row.CommentID, "implement")
+	if outboxErr != nil {
+		log.Printf("dispatchImplement: OutboxInsertPhased %s: %v", row.CommentID, outboxErr)
+	} else if !inserted {
+		log.Printf("dispatchImplement: outbox marker already existed for %s (idempotent re-run)", row.CommentID)
+	}
+	if inserted && deps.LarkClient != nil {
+		msg := FormatImplementerSummary(result, branchName, prURL, maxIterations, maxTokens)
+		if _, postErr := deps.LarkClient.PostComment(ctx, row.TaskID, msg, row.CommentID); postErr != nil {
+			log.Printf("dispatchImplement: PostComment %s: %v", row.CommentID, postErr)
+			// Non-fatal: outbox row remains as the record; operator can replay.
+		}
+	}
+	if err := deps.DB.MarkInboxProcessed(ctx, row.CommentID); err != nil {
+		log.Printf("dispatchImplement: MarkInboxProcessed %s: %v", row.CommentID, err)
+	}
+}
+
 // DispatchImplement executes the full autonomous-implementer flow for a single
 // inbox row with phase="implement".
 //
@@ -133,16 +187,29 @@ func tryOpenPR(ctx context.Context, outcome, branchName, prompt string) string {
 // closes that window. See cmd/supervisor/main.go's processOne for the canonical
 // caller pattern.
 //
-// Flow:
+// CRASH RECOVERY (codex round-2 #1): before any worktree/spawn work, check
+// whether an implementer_runs row already exists for this comment. Three cases:
+//
+//   - A) no prior row → fresh start, normal flow
+//   - B) prior row finalized (finished_at != nil) → crash between Finalize and
+//     MarkInboxProcessed. Skip respawn; reformat-and-repost from the persisted
+//     row so the operator still sees the result, then MarkInboxProcessed.
+//   - C) prior row not finalized (finished_at == nil) → crash mid-spawn. Don't
+//     respawn (the worktree may be in partial state). Synthesize a failure
+//     finalize on the existing row, post a "supervisor crashed" summary, and
+//     MarkInboxProcessed.
+//
+// Flow (case A, fresh start):
 //  1. Budget gate (CanSpawn) — defer on rejection.
-//  2. Worktree ensure (EnsureForTask).
-//  3. Insert implementer_runs row (started_at only).
-//  4. Spawn gnhf subprocess.
-//  5. Finalize run row (all gnhf_* + derived outcome + tokens_used + finished_at).
-//  6. Auto-PR (env-gated, OFF by default for MVP).
-//  7. Outbox row + inline Lark post (phase="implement").
+//  2. Idempotency guard (GetImplementerRunByCommentID) — short-circuit B/C.
+//  3. Worktree ensure (EnsureForTask).
+//  4. Insert implementer_runs row (started_at only).
+//  5. Spawn gnhf subprocess.
+//  6. Finalize run row (all gnhf_* + derived outcome + tokens_used + finished_at).
+//  7. Auto-PR (env-gated, OFF by default for MVP).
 //  8. Cleanup worktree (preserve if CommitCount>0, remove otherwise).
-//  9. MarkInboxProcessed.
+//  9. Outbox row + inline Lark post + MarkInboxProcessed
+//     (postSummaryAndMarkProcessed; shared with crash-recovery paths).
 //
 // Returns nil in all handled cases including ErrIncompleteLog. Non-nil only
 // for unexpected errors (EnsureForTask, InsertImplementerRun) that the caller
@@ -160,14 +227,69 @@ func DispatchImplement(ctx context.Context, row sqlite.InboxRow, deps Deps) erro
 		return nil
 	}
 
-	// Step 2: Worktree.
+	// Resolve ceiling values once — used by all paths (normal + recovery) so
+	// the formatter sees the same knobs gnhf would have seen.
+	resolved := GnhfArgs{}
+	ApplyDefaults(&resolved)
+	spawnMaxIterations := resolved.MaxIterations
+	spawnMaxTokens := resolved.MaxTokens // 0 = unbounded (no allowance line)
+
+	// Step 2: Idempotency guard — check for a prior implementer_runs row.
+	existing, found, lookupErr := deps.DB.GetImplementerRunByCommentID(ctx, row.CommentID)
+	if lookupErr != nil {
+		// Lookup failure is treated as fresh start (best-effort) but logged loudly.
+		// Worst case we re-spawn; that's better than hanging the inbox forever.
+		log.Printf("dispatchImplement: GetImplementerRunByCommentID %s: %v (continuing as fresh)", row.CommentID, lookupErr)
+		found = false
+	}
+	if found && existing.FinishedAt != nil {
+		// Case B: prior run completed; we crashed before MarkInboxProcessed.
+		// Reformat from persisted telemetry and re-post; do not respawn.
+		log.Printf("dispatchImplement: recovering completed run for %s (run id=%d) — skipping respawn",
+			row.CommentID, existing.ID)
+		recoveredResult := resultFromImplementerRun(existing)
+		postSummaryAndMarkProcessed(ctx, deps, row, recoveredResult,
+			existing.BranchName, existing.PRURL, spawnMaxIterations, spawnMaxTokens)
+		return nil
+	}
+	if found && existing.FinishedAt == nil {
+		// Case C: prior run started but never finalized. Worktree may be in
+		// partial state. Synthesize a failure finalize on the existing row.
+		log.Printf("dispatchImplement: recovering interrupted run for %s (run id=%d) — synthesizing failure",
+			row.CommentID, existing.ID)
+		synthResult := GnhfResult{
+			Status:        StatusAborted,
+			Reason:        ReasonUnknown,
+			LastMessage:   "supervisor crashed mid-run",
+			LogIncomplete: true,
+		}
+		fin := sqlite.ImplementerRunFinalize{
+			FinishedAt:      deps.Now().UnixMilli(),
+			Outcome:         deriveOutcome(synthResult),
+			GnhfStatus:      string(synthResult.Status),
+			GnhfReason:      string(synthResult.Reason),
+			GnhfLastMessage: synthResult.LastMessage,
+			Error:           "supervisor crashed mid-run; manual replay required",
+		}
+		if err := deps.DB.FinalizeImplementerRun(ctx, existing.ID, fin); err != nil {
+			log.Printf("dispatchImplement: FinalizeImplementerRun (recovery) %s: %v", row.CommentID, err)
+			// Non-fatal: still post and mark processed so the inbox doesn't loop.
+		}
+		postSummaryAndMarkProcessed(ctx, deps, row, synthResult,
+			existing.BranchName, "", spawnMaxIterations, spawnMaxTokens)
+		return nil
+	}
+
+	// Case A (fresh start) continues below.
+
+	// Step 3: Worktree.
 	wtPath, branchName, err := deps.Worktree.EnsureForTask(ctx, row.TaskID)
 	if err != nil {
 		log.Printf("dispatchImplement: EnsureForTask %s: %v", row.TaskID, err)
 		return fmt.Errorf("dispatchImplement: EnsureForTask: %w", err)
 	}
 
-	// Step 3: Insert run row (start marker only; finalized after spawn).
+	// Step 4: Insert run row (start marker only; finalized after spawn).
 	// Reuse the captured `now` for started_at — this records WHEN dispatch began,
 	// before the spawn-elapsed time is added. finished_at uses a FRESH deps.Now()
 	// after Spawn returns, so the duration (finished_at - started_at) is correct.
@@ -183,23 +305,21 @@ func DispatchImplement(ctx context.Context, row sqlite.InboxRow, deps Deps) erro
 		return fmt.Errorf("dispatchImplement: InsertImplementerRun: %w", err)
 	}
 
-	// Resolve ceiling values via ApplyDefaults so the formatter sees the exact
-	// same knobs gnhf will see — single source of truth in spawn.go. Future
-	// env-tunable overrides added to ApplyDefaults flow through here automatically.
-	// ApplyDefaults is idempotent; SpawnGnhf calls it again internally (no-op).
+	// Build the full GnhfArgs for spawn — Prompt/WorktreePath/ExpectedBranch on
+	// top of the already-resolved ceilings. ApplyDefaults is idempotent; SpawnGnhf
+	// calls it again internally (no-op).
 	args := GnhfArgs{
 		Prompt:         row.Content,
 		WorktreePath:   wtPath,
 		ExpectedBranch: branchName,
+		MaxIterations:  spawnMaxIterations,
+		MaxTokens:      spawnMaxTokens,
 	}
-	ApplyDefaults(&args)
-	spawnMaxIterations := args.MaxIterations
-	spawnMaxTokens := args.MaxTokens // 0 = unbounded (no allowance line)
 
-	// Step 4: Spawn gnhf subprocess.
+	// Step 5: Spawn gnhf subprocess.
 	result, spawnErr := deps.Spawn(ctx, args)
 
-	// Step 5: Derive outcome and finalize run row.
+	// Step 6: Derive outcome and finalize run row.
 	// For ErrIncompleteLog/*ErrAmbiguousRunDir the result is a usable synthesized
 	// struct — we always persist it. spawnErr only drives errStr / outcome override.
 	outcome := deriveOutcome(result)
@@ -233,7 +353,7 @@ func DispatchImplement(ctx context.Context, row sqlite.InboxRow, deps Deps) erro
 		Error:            errStr,
 	}
 
-	// Step 6: Auto-PR (env-gated OFF by default for MVP).
+	// Step 7: Auto-PR (env-gated OFF by default for MVP).
 	prURL := ""
 	if result.CommitCount > 0 {
 		prURL = tryOpenPR(ctx, outcome, branchName, row.Content)
@@ -251,6 +371,10 @@ func DispatchImplement(ctx context.Context, row sqlite.InboxRow, deps Deps) erro
 		// On finalize failure, surface pr_url in the log line if we managed to
 		// open one — otherwise the URL is permanently lost (the row UPDATE
 		// didn't land). Operators can recover by hand from the log.
+		// TODO(M3): on persistent DB failure, propagate err so caller applies
+		// fast-fail defer instead of silently MarkInboxProcessed-ing. For MVP,
+		// log + continue is acceptable — telemetry loss is rare and recoverable
+		// from gnhf.log on disk.
 		if fin.PRURL != "" {
 			log.Printf("dispatchImplement: FinalizeImplementerRun %s failed with pr_url=%s — URL may be lost: %v",
 				row.CommentID, fin.PRURL, err)
@@ -260,29 +384,6 @@ func DispatchImplement(ctx context.Context, row sqlite.InboxRow, deps Deps) erro
 		// Non-fatal: continue so outbox and cleanup still execute.
 	}
 
-	// Step 7: Outbox row + inline Lark post.
-	// OutboxInsertPhased records a (comment_id, phase="implement") dedup key.
-	// When inserted=true (first time), we immediately post the formatted summary
-	// to Lark — mirroring the dispatchNormal pattern (main.go:312-321).
-	// On inserted=false (idempotent re-run after crash), skip the post — a prior
-	// run either posted already or the outbox row serves as the record.
-	// On PostComment failure: log + continue (outbox row stays; operator can replay).
-	inserted, outboxErr := deps.DB.OutboxInsertPhased(ctx, row.CommentID, row.TaskID, row.CommentID, "implement")
-	if outboxErr != nil {
-		log.Printf("dispatchImplement: OutboxInsertPhased %s: %v", row.CommentID, outboxErr)
-	} else if !inserted {
-		// Existing row → idempotent re-run after crash recovery. Operators
-		// looking at duplicate processing should see this signal in the logs.
-		log.Printf("dispatchImplement: outbox marker already existed for %s (idempotent re-run)", row.CommentID)
-	}
-	if inserted && deps.LarkClient != nil {
-		msg := FormatImplementerSummary(result, branchName, prURL, spawnMaxIterations, spawnMaxTokens)
-		if _, postErr := deps.LarkClient.PostComment(ctx, row.TaskID, msg, row.CommentID); postErr != nil {
-			log.Printf("dispatchImplement: PostComment %s: %v", row.CommentID, postErr)
-			// Non-fatal: outbox row remains as the record; operator can replay.
-		}
-	}
-
 	// Step 8: Cleanup worktree.
 	// Preserve when commits were made; remove otherwise (avoids unbounded disk growth).
 	cleanupSuccess := result.CommitCount > 0
@@ -290,10 +391,10 @@ func DispatchImplement(ctx context.Context, row sqlite.InboxRow, deps Deps) erro
 		log.Printf("dispatchImplement: Cleanup %s: %v", row.TaskID, err)
 	}
 
-	// Step 9: MarkInboxProcessed.
-	if err := deps.DB.MarkInboxProcessed(ctx, row.CommentID); err != nil {
-		log.Printf("dispatchImplement: MarkInboxProcessed %s: %v", row.CommentID, err)
-	}
+	// Step 9: Outbox row + inline Lark post + MarkInboxProcessed (shared tail
+	// across normal flow + crash-recovery cases B and C).
+	postSummaryAndMarkProcessed(ctx, deps, row, result,
+		branchName, prURL, spawnMaxIterations, spawnMaxTokens)
 
 	return nil
 }
