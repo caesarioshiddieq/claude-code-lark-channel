@@ -23,6 +23,8 @@ type DBClient interface {
 	InsertImplementerRun(ctx context.Context, r sqlite.ImplementerRun) (int64, error)
 	FinalizeImplementerRun(ctx context.Context, id int64, fin sqlite.ImplementerRunFinalize) error
 	OutboxInsertPhased(ctx context.Context, commentID, taskID, replyTo, phase string) (bool, error)
+	OutboxCheck(ctx context.Context, hash string) (larkCommentID string, found bool, err error)
+	OutboxMarkPosted(ctx context.Context, hash, larkCommentID string) error
 	GetImplementerRunByCommentID(ctx context.Context, commentID string) (sqlite.ImplementerRun, bool, error)
 }
 
@@ -146,9 +148,19 @@ func resultFromImplementerRun(r sqlite.ImplementerRun) GnhfResult {
 }
 
 // postSummaryAndMarkProcessed handles the tail of all DispatchImplement paths
-// (normal completion, case B recovery, case C recovery): insert the outbox
-// marker, post the formatted summary to Lark when newly inserted, and finally
-// MarkInboxProcessed. All errors are logged; none propagate.
+// (normal completion, case B recovery, case C recovery): insert (or re-detect)
+// the outbox marker, post the formatted summary to Lark when the post hasn't
+// happened yet, mark the outbox row posted, and finally MarkInboxProcessed.
+// All errors are logged; none propagate.
+//
+// Codex round-3 #1: case-B recovery is the EXACT crash window where the
+// outbox marker was already inserted before the crash, so InsertPhased
+// returns inserted=false. Using inserted as the dedup signal would skip the
+// post and permanently lose the implementer summary. Instead, on
+// inserted=false, OutboxCheck reads lark_comment_id: empty string means the
+// post never happened (recovery path → re-post); non-empty means the post
+// already succeeded (idempotent re-run → skip). OutboxMarkPosted records the
+// returned lark_comment_id on successful post so the next replay sees it.
 func postSummaryAndMarkProcessed(
 	ctx context.Context,
 	deps Deps,
@@ -158,19 +170,57 @@ func postSummaryAndMarkProcessed(
 	maxIterations int,
 	maxTokens int64,
 ) {
+	hash := row.CommentID + ":implement"
+
 	inserted, outboxErr := deps.DB.OutboxInsertPhased(ctx, row.CommentID, row.TaskID, row.CommentID, "implement")
 	if outboxErr != nil {
 		log.Printf("dispatchImplement: OutboxInsertPhased %s: %v", row.CommentID, outboxErr)
-	} else if !inserted {
-		log.Printf("dispatchImplement: outbox marker already existed for %s (idempotent re-run)", row.CommentID)
+		// Continue: still try to MarkInboxProcessed so the inbox doesn't loop.
+		if err := deps.DB.MarkInboxProcessed(ctx, row.CommentID); err != nil {
+			log.Printf("dispatchImplement: MarkInboxProcessed %s: %v", row.CommentID, err)
+		}
+		return
 	}
-	if inserted && deps.LarkClient != nil {
-		msg := FormatImplementerSummary(result, branchName, prURL, maxIterations, maxTokens)
-		if _, postErr := deps.LarkClient.PostComment(ctx, row.TaskID, msg, row.CommentID); postErr != nil {
-			log.Printf("dispatchImplement: PostComment %s: %v", row.CommentID, postErr)
-			// Non-fatal: outbox row remains as the record; operator can replay.
+
+	// Decide whether to post. Two truthful signals:
+	//   1. inserted=true  → fresh marker, definitely haven't posted yet.
+	//   2. inserted=false → marker existed; check lark_comment_id to disambiguate
+	//      between "post already succeeded" and "marker inserted but post never
+	//      happened" (case B/C crash window).
+	shouldPost := inserted
+	if !inserted {
+		existingLarkID, found, checkErr := deps.DB.OutboxCheck(ctx, hash)
+		switch {
+		case checkErr != nil:
+			log.Printf("dispatchImplement: OutboxCheck %s: %v (skipping post)", row.CommentID, checkErr)
+		case !found:
+			// Pathological: InsertPhased said not-inserted, so the row should
+			// exist. Log and skip post defensively.
+			log.Printf("dispatchImplement: outbox marker missing despite !inserted for %s — skipping post", row.CommentID)
+		case existingLarkID == "":
+			// Marker exists but never posted (case B/C recovery): re-post.
+			log.Printf("dispatchImplement: recovering — outbox marker exists for %s but no lark_comment_id; re-posting", row.CommentID)
+			shouldPost = true
+		default:
+			// existingLarkID != "" → already posted on a prior run, skip.
+			log.Printf("dispatchImplement: outbox marker already posted for %s (lark_comment_id=%s) — skipping",
+				row.CommentID, existingLarkID)
 		}
 	}
+
+	if shouldPost && deps.LarkClient != nil {
+		msg := FormatImplementerSummary(result, branchName, prURL, maxIterations, maxTokens)
+		larkCommentID, postErr := deps.LarkClient.PostComment(ctx, row.TaskID, msg, row.CommentID)
+		if postErr != nil {
+			log.Printf("dispatchImplement: PostComment %s: %v", row.CommentID, postErr)
+			// Don't MarkPosted on failure — next replay will retry via OutboxCheck path.
+		} else if markErr := deps.DB.OutboxMarkPosted(ctx, hash, larkCommentID); markErr != nil {
+			log.Printf("dispatchImplement: OutboxMarkPosted %s: %v", row.CommentID, markErr)
+			// Non-fatal: post succeeded; the next replay would re-post (acceptable
+			// over the rare DB hiccup; Lark dedup is best-effort here).
+		}
+	}
+
 	if err := deps.DB.MarkInboxProcessed(ctx, row.CommentID); err != nil {
 		log.Printf("dispatchImplement: MarkInboxProcessed %s: %v", row.CommentID, err)
 	}
@@ -237,10 +287,17 @@ func DispatchImplement(ctx context.Context, row sqlite.InboxRow, deps Deps) erro
 	// Step 2: Idempotency guard — check for a prior implementer_runs row.
 	existing, found, lookupErr := deps.DB.GetImplementerRunByCommentID(ctx, row.CommentID)
 	if lookupErr != nil {
-		// Lookup failure is treated as fresh start (best-effort) but logged loudly.
-		// Worst case we re-spawn; that's better than hanging the inbox forever.
-		log.Printf("dispatchImplement: GetImplementerRunByCommentID %s: %v (continuing as fresh)", row.CommentID, lookupErr)
-		found = false
+		// Codex round-3 #2: lookup failure must DEFER the row, not continue as
+		// fresh — continuing would risk a duplicate gnhf spawn the moment the
+		// transient DB error clears (the prior row would still be there and we
+		// just couldn't see it). MarkDeferred + return shifts the retry into
+		// the next poll cycle by which point the DB should be healthy.
+		log.Printf("dispatchImplement: GetImplementerRunByCommentID %s: %v (deferring)", row.CommentID, lookupErr)
+		deferUntil := deps.Now().Add(60 * time.Second).UnixMilli()
+		if markErr := deps.DB.MarkDeferred(ctx, row.CommentID, deferUntil, row.Content); markErr != nil {
+			log.Printf("dispatchImplement: MarkDeferred (lookup fail): %v", markErr)
+		}
+		return nil
 	}
 	if found && existing.FinishedAt != nil {
 		// Case B: prior run completed; we crashed before MarkInboxProcessed.
