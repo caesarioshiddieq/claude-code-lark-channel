@@ -131,10 +131,13 @@ func makeRow(commentID, taskID, content, source string) sqlite.InboxRow {
 
 // nightEnvOn forces CanSpawn to allow autonomous spawns by setting the night
 // window to cover the full 24-hour clock (NIGHT_START=0, NIGHT_END=23).
+// Also sets LOCK_DIR to a temp directory so LockTask succeeds in tests
+// without needing /var/lib/claude-vm/sessions to exist.
 func nightEnvOn(t *testing.T) {
 	t.Helper()
 	t.Setenv("NIGHT_START", "0")
 	t.Setenv("NIGHT_END", "23")
+	t.Setenv("LOCK_DIR", t.TempDir())
 }
 
 // dayEnvOn forces CanSpawn to reject autonomous spawns by placing the night

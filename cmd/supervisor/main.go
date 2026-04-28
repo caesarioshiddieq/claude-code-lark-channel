@@ -15,9 +15,11 @@ import (
 	"github.com/caesarioshiddieq/claude-code-lark-channel/internal/budget"
 	"github.com/caesarioshiddieq/claude-code-lark-channel/internal/echo"
 	"github.com/caesarioshiddieq/claude-code-lark-channel/internal/gc"
+	"github.com/caesarioshiddieq/claude-code-lark-channel/internal/implementer"
 	"github.com/caesarioshiddieq/claude-code-lark-channel/internal/lark"
 	sqlite "github.com/caesarioshiddieq/claude-code-lark-channel/internal/sqlite"
 	"github.com/caesarioshiddieq/claude-code-lark-channel/internal/worker"
+	"github.com/caesarioshiddieq/claude-code-lark-channel/internal/worktree"
 )
 
 type config struct {
@@ -212,7 +214,13 @@ func processOne(ctx context.Context, db *sqlite.DB, client *lark.Client, maxTurn
 		}
 		return
 	}
-	defer worker.UnlockTask(lockFile)
+	// Use a closure so the implement case can set lockFile=nil to signal that
+	// it already released the lock (DispatchImplement acquires its own).
+	defer func() {
+		if lockFile != nil {
+			worker.UnlockTask(lockFile)
+		}
+	}()
 
 	sessionUUID, isNew, err := resolveSession(ctx, db, row.TaskID)
 	if err != nil {
@@ -228,6 +236,24 @@ func processOne(ctx context.Context, db *sqlite.DB, client *lark.Client, maxTurn
 		dispatchAnswer(ctx, db, client, row, sessionUUID)
 	case "compact":
 		dispatchCompact(ctx, db, client, row, sessionUUID)
+	case "implement":
+		// Release the processOne flock before handing off — DispatchImplement
+		// acquires its own flock internally. Holding both simultaneously on the
+		// same taskID would deadlock if the same task is dispatched concurrently.
+		worker.UnlockTask(lockFile)
+		lockFile = nil // prevent the deferred UnlockTask from double-releasing
+		repoPath := os.Getenv("IMPLEMENTER_DEFAULT_REPO")
+		deps := implementer.Deps{
+			DB:        db,
+			Worktree:  worktree.New(repoPath, ""),
+			Spawn:     implementer.SpawnGnhf,
+			RepoPath:  repoPath,
+			Now:       time.Now,
+			JitterMin: getJitterMinutes(),
+		}
+		if err := implementer.DispatchImplement(ctx, row, deps); err != nil {
+			log.Printf("dispatchImplement %s: %v", row.CommentID, err)
+		}
 	default:
 		dispatchNormal(ctx, db, client, row, sessionUUID, isNew, maxTurns)
 	}
