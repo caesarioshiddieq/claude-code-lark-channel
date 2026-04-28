@@ -227,7 +227,7 @@ func DispatchImplement(ctx context.Context, row sqlite.InboxRow, deps Deps) erro
 
 	// Inject the finalize timestamp from the dispatcher's clock so it stays
 	// consistent with started_at and tests can assert determinism.
-	fin.FinishedAt = deps.Now().UnixMilli()
+	fin.FinishedAt = now.UnixMilli()
 
 	if err := deps.DB.FinalizeImplementerRun(ctx, runID, fin); err != nil {
 		// On finalize failure, surface pr_url in the log line if we managed to
