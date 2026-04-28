@@ -5,16 +5,17 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"time"
 )
 
 // ImplementerRun represents a single autonomous-implementer execution against
 // a Lark task comment. One row is inserted at spawn time with started_at set
-// and outcome empty; on subprocess exit, UpdateImplementerRunOutcome
-// finalizes the row with the gnhf-derived stats and the final outcome string.
+// and outcome empty; on subprocess exit, FinalizeImplementerRun finalizes the
+// row with all gnhf-derived stats plus the legacy outcome string.
 //
-// FinishedAt is *int64 because the column is NULL until the outcome is
-// recorded.
+// FinishedAt is *int64 because the column is NULL until finalization. The 9
+// gnhf_* fields (added by migration0005) hold the native gnhf run telemetry;
+// they are written by FinalizeImplementerRun and read by Task 6's Lark
+// formatter via GetImplementerRunByCommentID.
 type ImplementerRun struct {
 	ID              int64
 	InboxCommentID  string
@@ -30,6 +31,18 @@ type ImplementerRun struct {
 	PRURL           string
 	NotesMDExcerpt  string
 	Error           string
+
+	// gnhf_* native columns (migration0005). Populated by
+	// FinalizeImplementerRun; read back via GetImplementerRunByCommentID.
+	GnhfStatus       string
+	GnhfReason       string
+	GnhfSuccessCount int
+	GnhfFailCount    int
+	GnhfInputTokens  int
+	GnhfOutputTokens int
+	GnhfRunID        string
+	GnhfNoProgress   bool
+	GnhfLastMessage  string
 }
 
 // ImplementerRunOutcome carries the post-spawn stats written by
@@ -67,8 +80,13 @@ func (d *DB) InsertImplementerRun(ctx context.Context, r ImplementerRun) (int64,
 // migration0005, the derived legacy outcome/tokens_used, pr_url (set later if
 // gh pr create succeeds), notes_md_excerpt, and an error string for
 // failed/timeout runs.
+//
+// FinishedAt is caller-injected (unix ms) so tests can use a synthetic clock
+// and so it stays consistent with StartedAt, which is also caller-controlled
+// via deps.Now in the dispatcher.
 type ImplementerRunFinalize struct {
 	// Derived legacy columns (computed by dispatcher from GnhfResult).
+	FinishedAt     int64
 	Outcome        string
 	TokensUsed     int
 	PRURL          string
@@ -117,7 +135,7 @@ func (d *DB) FinalizeImplementerRun(ctx context.Context, id int64, f Implementer
 		error              = ?
 		WHERE id = ?`
 	_, err := d.db.ExecContext(ctx, query,
-		time.Now().UnixMilli(),
+		f.FinishedAt,
 		f.Outcome,
 		f.GnhfStatus,
 		f.GnhfReason,
@@ -172,18 +190,25 @@ func (d *DB) UpdateImplementerRunOutcome(ctx context.Context, id int64, o Implem
 func (d *DB) GetImplementerRunByCommentID(ctx context.Context, commentID string) (ImplementerRun, bool, error) {
 	const q = `SELECT id, inbox_comment_id, task_id, started_at, finished_at,
 		outcome, gnhf_iterations, gnhf_commits_made, tokens_used,
-		worktree_path, branch_name, pr_url, notes_md_excerpt, error
+		worktree_path, branch_name, pr_url, notes_md_excerpt, error,
+		gnhf_status, gnhf_reason, gnhf_success_count, gnhf_fail_count,
+		gnhf_input_tokens, gnhf_output_tokens, gnhf_run_id,
+		gnhf_no_progress, gnhf_last_message
 		FROM implementer_runs
 		WHERE inbox_comment_id = ?
 		ORDER BY id DESC
 		LIMIT 1`
 	var r ImplementerRun
 	var finishedAt sql.NullInt64
+	var noProgress int
 	err := d.db.QueryRowContext(ctx, q, commentID).Scan(
 		&r.ID, &r.InboxCommentID, &r.TaskID, &r.StartedAt, &finishedAt,
 		&r.Outcome, &r.GnhfIterations, &r.GnhfCommitsMade, &r.TokensUsed,
 		&r.WorktreePath, &r.BranchName, &r.PRURL,
 		&r.NotesMDExcerpt, &r.Error,
+		&r.GnhfStatus, &r.GnhfReason, &r.GnhfSuccessCount, &r.GnhfFailCount,
+		&r.GnhfInputTokens, &r.GnhfOutputTokens, &r.GnhfRunID,
+		&noProgress, &r.GnhfLastMessage,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ImplementerRun{}, false, nil
@@ -195,5 +220,6 @@ func (d *DB) GetImplementerRunByCommentID(ctx context.Context, commentID string)
 		v := finishedAt.Int64
 		r.FinishedAt = &v
 	}
+	r.GnhfNoProgress = noProgress != 0
 	return r, true, nil
 }

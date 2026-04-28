@@ -222,13 +222,21 @@ func processOne(ctx context.Context, db *sqlite.DB, client *lark.Client, maxTurn
 		}
 	}()
 
-	sessionUUID, isNew, err := resolveSession(ctx, db, row.TaskID)
-	if err != nil {
-		log.Printf("processOne: resolveSession %s: %v", row.TaskID, err)
-		if markErr := db.MarkDeferred(ctx, row.CommentID, fastFailBackoff().UnixMilli(), row.Content); markErr != nil {
-			log.Printf("processOne: MarkDeferred (resolveSession fail): %v", markErr)
+	// resolveSession is only needed for phases that drive a Claude session
+	// (answer/compact/normal). The implement phase manages its own worktree
+	// and never touches the sessions table — skip the round-trip.
+	var sessionUUID string
+	var isNew bool
+	if row.Phase != "implement" {
+		var err error
+		sessionUUID, isNew, err = resolveSession(ctx, db, row.TaskID)
+		if err != nil {
+			log.Printf("processOne: resolveSession %s: %v", row.TaskID, err)
+			if markErr := db.MarkDeferred(ctx, row.CommentID, fastFailBackoff().UnixMilli(), row.Content); markErr != nil {
+				log.Printf("processOne: MarkDeferred (resolveSession fail): %v", markErr)
+			}
+			return
 		}
-		return
 	}
 
 	switch row.Phase {

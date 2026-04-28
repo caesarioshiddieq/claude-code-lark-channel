@@ -163,10 +163,12 @@ func DispatchImplement(ctx context.Context, row sqlite.InboxRow, deps Deps) erro
 	}
 
 	// Step 4: Insert run row (start marker only; finalized after spawn).
+	// Reuse the captured `now` rather than calling deps.Now() again — keeps
+	// timestamps consistent and avoids advancing a synthetic test clock twice.
 	runID, err := deps.DB.InsertImplementerRun(ctx, sqlite.ImplementerRun{
 		InboxCommentID: row.CommentID,
 		TaskID:         row.TaskID,
-		StartedAt:      deps.Now().Unix(),
+		StartedAt:      now.Unix(),
 		WorktreePath:   wtPath,
 		BranchName:     branchName,
 	})
@@ -223,8 +225,20 @@ func DispatchImplement(ctx context.Context, row sqlite.InboxRow, deps Deps) erro
 	}
 	fin.PRURL = prURL
 
+	// Inject the finalize timestamp from the dispatcher's clock so it stays
+	// consistent with started_at and tests can assert determinism.
+	fin.FinishedAt = deps.Now().UnixMilli()
+
 	if err := deps.DB.FinalizeImplementerRun(ctx, runID, fin); err != nil {
-		log.Printf("dispatchImplement: FinalizeImplementerRun %s: %v", row.CommentID, err)
+		// On finalize failure, surface pr_url in the log line if we managed to
+		// open one — otherwise the URL is permanently lost (the row UPDATE
+		// didn't land). Operators can recover by hand from the log.
+		if fin.PRURL != "" {
+			log.Printf("dispatchImplement: FinalizeImplementerRun %s failed with pr_url=%s — URL may be lost: %v",
+				row.CommentID, fin.PRURL, err)
+		} else {
+			log.Printf("dispatchImplement: FinalizeImplementerRun %s: %v", row.CommentID, err)
+		}
 		// Non-fatal: continue so outbox and cleanup still execute.
 	}
 
@@ -233,8 +247,13 @@ func DispatchImplement(ctx context.Context, row sqlite.InboxRow, deps Deps) erro
 	// key so OutboxFlush knows a reply is owed. Task 6 composes the actual
 	// Lark reply body at flush time by reading implementer_runs via
 	// GetImplementerRunByCommentID.
-	if _, err := deps.DB.OutboxInsertPhased(ctx, row.CommentID, row.TaskID, row.CommentID, "implement"); err != nil {
-		log.Printf("dispatchImplement: OutboxInsertPhased %s: %v", row.CommentID, err)
+	inserted, outboxErr := deps.DB.OutboxInsertPhased(ctx, row.CommentID, row.TaskID, row.CommentID, "implement")
+	if outboxErr != nil {
+		log.Printf("dispatchImplement: OutboxInsertPhased %s: %v", row.CommentID, outboxErr)
+	} else if !inserted {
+		// Existing row → idempotent re-run after crash recovery. Operators
+		// looking at duplicate processing should see this signal in the logs.
+		log.Printf("dispatchImplement: outbox marker already existed for %s (idempotent re-run)", row.CommentID)
 	}
 
 	// Step 9: Cleanup worktree.
