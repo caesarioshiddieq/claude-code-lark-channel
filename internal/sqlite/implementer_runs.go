@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 )
 
 // ImplementerRun represents a single autonomous-implementer execution against
@@ -61,6 +62,89 @@ func (d *DB) InsertImplementerRun(ctx context.Context, r ImplementerRun) (int64,
 	return id, nil
 }
 
+// ImplementerRunFinalize carries the full post-spawn data written by
+// FinalizeImplementerRun. It includes all nine gnhf_* native columns from
+// migration0005, the derived legacy outcome/tokens_used, pr_url (set later if
+// gh pr create succeeds), notes_md_excerpt, and an error string for
+// failed/timeout runs.
+type ImplementerRunFinalize struct {
+	// Derived legacy columns (computed by dispatcher from GnhfResult).
+	Outcome        string
+	TokensUsed     int
+	PRURL          string
+	NotesMDExcerpt string
+	Error          string
+
+	// gnhf_* native columns (migration0005).
+	GnhfStatus       string
+	GnhfReason       string
+	GnhfIterations   int
+	GnhfCommitsMade  int
+	GnhfSuccessCount int
+	GnhfFailCount    int
+	GnhfInputTokens  int
+	GnhfOutputTokens int
+	GnhfRunID        string
+	GnhfNoProgress   bool
+	GnhfLastMessage  string
+}
+
+// FinalizeImplementerRun writes all gnhf_* native columns, the derived legacy
+// outcome/tokens_used, pr_url, notes_md_excerpt, error, and finished_at in a
+// single UPDATE. Use this instead of UpdateImplementerRunOutcome for Task 5+.
+func (d *DB) FinalizeImplementerRun(ctx context.Context, id int64, f ImplementerRunFinalize) error {
+	noProgress := 0
+	if f.GnhfNoProgress {
+		noProgress = 1
+	}
+	const query = `UPDATE implementer_runs SET
+		finished_at        = ?,
+		outcome            = ?,
+		gnhf_status        = ?,
+		gnhf_reason        = ?,
+		gnhf_iterations    = ?,
+		gnhf_commits_made  = ?,
+		gnhf_success_count = ?,
+		gnhf_fail_count    = ?,
+		gnhf_input_tokens  = ?,
+		gnhf_output_tokens = ?,
+		gnhf_run_id        = ?,
+		gnhf_no_progress   = ?,
+		gnhf_last_message  = ?,
+		tokens_used        = ?,
+		pr_url             = ?,
+		notes_md_excerpt   = ?,
+		error              = ?
+		WHERE id = ?`
+	_, err := d.db.ExecContext(ctx, query,
+		time.Now().UnixMilli(),
+		f.Outcome,
+		f.GnhfStatus,
+		f.GnhfReason,
+		f.GnhfIterations,
+		f.GnhfCommitsMade,
+		f.GnhfSuccessCount,
+		f.GnhfFailCount,
+		f.GnhfInputTokens,
+		f.GnhfOutputTokens,
+		f.GnhfRunID,
+		noProgress,
+		f.GnhfLastMessage,
+		f.TokensUsed,
+		f.PRURL,
+		f.NotesMDExcerpt,
+		f.Error,
+		id,
+	)
+	if err != nil {
+		return fmt.Errorf("finalize implementer_run: %w", err)
+	}
+	return nil
+}
+
+// Deprecated: use FinalizeImplementerRun. UpdateImplementerRunOutcome is kept
+// for backwards compatibility with Task 1 tests; it writes only the legacy
+// columns and does not set the gnhf_* native fields added in migration0005.
 func (d *DB) UpdateImplementerRunOutcome(ctx context.Context, id int64, o ImplementerRunOutcome) error {
 	const q = `UPDATE implementer_runs SET
 		finished_at       = ?,
