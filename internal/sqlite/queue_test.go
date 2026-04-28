@@ -527,3 +527,52 @@ func TestMigration0002_BackfillUpdatesExistingRows(t *testing.T) {
 		t.Errorf("expected comment_id='' for NULL reply_to_comment_id, got %q", commentIDNull)
 	}
 }
+
+// TestNextInboxRow_ImplementPriority asserts the CASE-ordering in NextInboxRow:
+//
+//	answer(1) < compact(2) < implement(3) < normal/other(4)
+//
+// Four rows are inserted at the same created_at so only the CASE priority
+// determines which one is returned first. Each row is processed before the
+// next assertion so the queue drains in order.
+func TestNextInboxRow_ImplementPriority(t *testing.T) {
+	db := openTestDB(t)
+	ctx := context.Background()
+
+	// Same created_at for all — phase priority is the only differentiator.
+	const ts = 1000
+	db.RawDB().Exec(`INSERT INTO inbox (comment_id,task_id,content,creator_id,created_at,source,phase)
+		VALUES ('C-normal','T-normal','hi','U1',?,'human','normal')`, ts)
+	db.RawDB().Exec(`INSERT INTO inbox (comment_id,task_id,content,creator_id,created_at,source,phase)
+		VALUES ('C-implement','T-implement','hi','U1',?,'autonomous','implement')`, ts)
+	db.RawDB().Exec(`INSERT INTO inbox (comment_id,task_id,content,creator_id,created_at,source,phase)
+		VALUES ('C-compact','T-compact','hi','U1',?,'human','compact')`, ts)
+	db.RawDB().Exec(`INSERT INTO inbox (comment_id,task_id,content,creator_id,created_at,source,phase)
+		VALUES ('C-answer','T-answer','hi','U1',?,'human','answer')`, ts)
+
+	want := []string{"C-answer", "C-compact", "C-implement", "C-normal"}
+	for i, wantID := range want {
+		row, found, err := db.NextInboxRow(ctx)
+		if err != nil {
+			t.Fatalf("step %d NextInboxRow: %v", i, err)
+		}
+		if !found {
+			t.Fatalf("step %d: expected a row, got none", i)
+		}
+		if row.CommentID != wantID {
+			t.Errorf("step %d: got %q want %q (phase=%q)", i, row.CommentID, wantID, row.Phase)
+		}
+		if err := db.MarkInboxProcessed(ctx, row.CommentID); err != nil {
+			t.Fatalf("step %d MarkInboxProcessed: %v", i, err)
+		}
+	}
+
+	// Queue should now be empty.
+	_, found, err := db.NextInboxRow(ctx)
+	if err != nil {
+		t.Fatalf("final NextInboxRow: %v", err)
+	}
+	if found {
+		t.Error("expected empty queue after draining all 4 rows")
+	}
+}
