@@ -360,7 +360,13 @@ func TestSpawnGnhf_ExcludePathLandsInCommonGitDir(t *testing.T) {
 		t.Errorf("expect .gnhf/ in %s, got:\n%s", excludePath, data)
 	}
 
-	// Calling SpawnGnhf again must not duplicate the entry (idempotency)
+	// Calling SpawnGnhf again must not duplicate the entry (idempotency).
+	// Clear the runs dir so the mock can create the same runID without
+	// confusing the set-difference run-id discovery (the test we want here
+	// is exclude-file idempotency, not run discovery).
+	if err := os.RemoveAll(filepath.Join(wtDir, ".gnhf")); err != nil {
+		t.Fatalf("clear .gnhf: %v", err)
+	}
 	if _, err := implementer.SpawnGnhf(ctx, args); err != nil {
 		t.Fatalf("SpawnGnhf (second call): %v", err)
 	}
