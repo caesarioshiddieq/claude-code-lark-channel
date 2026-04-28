@@ -209,7 +209,9 @@ func TestFinalizeImplementerRun_Success(t *testing.T) {
 		t.Fatalf("insert: %v", err)
 	}
 
+	finished := started + 1_234_567
 	fin := q.ImplementerRunFinalize{
+		FinishedAt:       finished,
 		Outcome:          "success",
 		GnhfStatus:       "stopped",
 		GnhfReason:       "stop_when",
@@ -241,6 +243,9 @@ func TestFinalizeImplementerRun_Success(t *testing.T) {
 	if got.FinishedAt == nil {
 		t.Fatal("FinishedAt must be non-nil after finalize")
 	}
+	if *got.FinishedAt != finished {
+		t.Errorf("FinishedAt: got %d want %d (caller-injected, not time.Now)", *got.FinishedAt, finished)
+	}
 	if got.GnhfIterations != 5 {
 		t.Errorf("GnhfIterations: got %d want 5", got.GnhfIterations)
 	}
@@ -256,47 +261,26 @@ func TestFinalizeImplementerRun_Success(t *testing.T) {
 	if got.Error != "" {
 		t.Errorf("Error: got %q want empty", got.Error)
 	}
-
-	// Verify gnhf_* columns via raw SQL (GetImplementerRunByCommentID doesn't
-	// scan all gnhf_* yet; we verify them directly).
-	var (
-		gnhfStatus       string
-		gnhfReason       string
-		gnhfSuccessCount int
-		gnhfFailCount    int
-		gnhfInputTokens  int
-		gnhfOutputTokens int
-		gnhfRunID        string
-		gnhfNoProgress   int
-		gnhfLastMessage  string
-	)
-	err = db.RawDB().QueryRowContext(ctx, `SELECT
-		gnhf_status, gnhf_reason, gnhf_success_count, gnhf_fail_count,
-		gnhf_input_tokens, gnhf_output_tokens, gnhf_run_id, gnhf_no_progress, gnhf_last_message
-		FROM implementer_runs WHERE id = ?`, id).Scan(
-		&gnhfStatus, &gnhfReason, &gnhfSuccessCount, &gnhfFailCount,
-		&gnhfInputTokens, &gnhfOutputTokens, &gnhfRunID, &gnhfNoProgress, &gnhfLastMessage,
-	)
-	if err != nil {
-		t.Fatalf("raw gnhf_ query: %v", err)
+	// gnhf_* columns now read by GetImplementerRunByCommentID — assert
+	// directly off the struct rather than via raw SQL (the raw-SQL fallback
+	// was a smell that the SELECT was incomplete).
+	if got.GnhfStatus != "stopped" {
+		t.Errorf("GnhfStatus: got %q want stopped", got.GnhfStatus)
 	}
-	if gnhfStatus != "stopped" {
-		t.Errorf("gnhf_status: got %q want stopped", gnhfStatus)
+	if got.GnhfReason != "stop_when" {
+		t.Errorf("GnhfReason: got %q want stop_when", got.GnhfReason)
 	}
-	if gnhfReason != "stop_when" {
-		t.Errorf("gnhf_reason: got %q want stop_when", gnhfReason)
+	if got.GnhfSuccessCount != 3 {
+		t.Errorf("GnhfSuccessCount: got %d want 3", got.GnhfSuccessCount)
 	}
-	if gnhfSuccessCount != 3 {
-		t.Errorf("gnhf_success_count: got %d want 3", gnhfSuccessCount)
+	if got.GnhfRunID != "run-abc" {
+		t.Errorf("GnhfRunID: got %q want run-abc", got.GnhfRunID)
 	}
-	if gnhfRunID != "run-abc" {
-		t.Errorf("gnhf_run_id: got %q want run-abc", gnhfRunID)
+	if got.GnhfNoProgress {
+		t.Errorf("GnhfNoProgress: got true, want false")
 	}
-	if gnhfNoProgress != 0 {
-		t.Errorf("gnhf_no_progress: got %d want 0", gnhfNoProgress)
-	}
-	if gnhfLastMessage != "stop condition met" {
-		t.Errorf("gnhf_last_message: got %q", gnhfLastMessage)
+	if got.GnhfLastMessage != "stop condition met" {
+		t.Errorf("GnhfLastMessage: got %q", got.GnhfLastMessage)
 	}
 }
 
@@ -316,6 +300,7 @@ func TestFinalizeImplementerRun_Failed(t *testing.T) {
 	}
 
 	fin := q.ImplementerRunFinalize{
+		FinishedAt:       time.Now().UnixMilli(),
 		Outcome:          "failed",
 		GnhfStatus:       "aborted",
 		GnhfReason:       "max_failures",
@@ -347,5 +332,81 @@ func TestFinalizeImplementerRun_Failed(t *testing.T) {
 	}
 	if got.TokensUsed != 2500 {
 		t.Errorf("TokensUsed: got %d want 2500", got.TokensUsed)
+	}
+}
+
+// TestGetImplementerRunByCommentID_ReturnsAllGnhfFields is a dedicated
+// round-trip that writes every gnhf_* column via FinalizeImplementerRun and
+// asserts each one is correctly read back through GetImplementerRunByCommentID.
+// Closes the gap that Task 6's Lark formatter would have hit when reading
+// gnhf_status/reason/etc and getting zero values.
+func TestGetImplementerRunByCommentID_ReturnsAllGnhfFields(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+
+	id, err := db.InsertImplementerRun(ctx, q.ImplementerRun{
+		InboxCommentID: "c-rt-1",
+		TaskID:         "task-rt-1",
+		StartedAt:      time.Now().UnixMilli(),
+	})
+	if err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	fin := q.ImplementerRunFinalize{
+		FinishedAt:       time.Now().UnixMilli() + 1000,
+		Outcome:          "blocked",
+		TokensUsed:       3300,
+		PRURL:            "",
+		NotesMDExcerpt:   "stop reached without commit",
+		Error:            "",
+		GnhfStatus:       "stopped",
+		GnhfReason:       "stop_when",
+		GnhfIterations:   8,
+		GnhfCommitsMade:  0,
+		GnhfSuccessCount: 7,
+		GnhfFailCount:    1,
+		GnhfInputTokens:  2200,
+		GnhfOutputTokens: 1100,
+		GnhfRunID:        "run-roundtrip",
+		GnhfNoProgress:   true,
+		GnhfLastMessage:  "stop condition met without progress",
+	}
+	if err := db.FinalizeImplementerRun(ctx, id, fin); err != nil {
+		t.Fatalf("finalize: %v", err)
+	}
+
+	got, found, err := db.GetImplementerRunByCommentID(ctx, "c-rt-1")
+	if err != nil || !found {
+		t.Fatalf("get: err=%v found=%v", err, found)
+	}
+
+	// Verify each gnhf_* field round-trips correctly.
+	if got.GnhfStatus != "stopped" {
+		t.Errorf("GnhfStatus: got %q want stopped", got.GnhfStatus)
+	}
+	if got.GnhfReason != "stop_when" {
+		t.Errorf("GnhfReason: got %q want stop_when", got.GnhfReason)
+	}
+	if got.GnhfSuccessCount != 7 {
+		t.Errorf("GnhfSuccessCount: got %d want 7", got.GnhfSuccessCount)
+	}
+	if got.GnhfFailCount != 1 {
+		t.Errorf("GnhfFailCount: got %d want 1", got.GnhfFailCount)
+	}
+	if got.GnhfInputTokens != 2200 {
+		t.Errorf("GnhfInputTokens: got %d want 2200", got.GnhfInputTokens)
+	}
+	if got.GnhfOutputTokens != 1100 {
+		t.Errorf("GnhfOutputTokens: got %d want 1100", got.GnhfOutputTokens)
+	}
+	if got.GnhfRunID != "run-roundtrip" {
+		t.Errorf("GnhfRunID: got %q want run-roundtrip", got.GnhfRunID)
+	}
+	if !got.GnhfNoProgress {
+		t.Errorf("GnhfNoProgress: got false want true (column should round-trip 1→true)")
+	}
+	if got.GnhfLastMessage != "stop condition met without progress" {
+		t.Errorf("GnhfLastMessage: got %q", got.GnhfLastMessage)
 	}
 }

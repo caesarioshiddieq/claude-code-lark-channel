@@ -257,6 +257,10 @@ func TestDispatchImplement_Success(t *testing.T) {
 	if fin.TokensUsed != 1500 {
 		t.Errorf("tokens_used: got %d want 1500 (1000+500)", fin.TokensUsed)
 	}
+	// Dispatcher must inject finished_at via deps.Now (not the SQL layer's clock).
+	if fin.FinishedAt == 0 {
+		t.Error("FinishedAt must be set by the dispatcher (deps.Now), got zero")
+	}
 	assertOutboxMarker(t, db, row)
 	// CommitCount=3 → worktree preserved (Cleanup called with success=true).
 	if len(wt.cleanupCalls) != 1 {
