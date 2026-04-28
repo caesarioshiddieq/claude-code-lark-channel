@@ -2,8 +2,10 @@ package implementer_test
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -498,4 +500,182 @@ func TestDispatchImplement_StoppedUnknown(t *testing.T) {
 	if fin.Outcome != "stopped" {
 		t.Errorf("outcome: got %q want stopped", fin.Outcome)
 	}
+}
+
+// ---- fakeLarkClient ----
+
+type postCall struct {
+	TaskID           string
+	Content          string
+	ReplyToCommentID string
+}
+
+type fakeLarkClient struct {
+	mu        sync.Mutex
+	calls     []postCall
+	returnErr error
+	returnID  string
+}
+
+func (f *fakeLarkClient) PostComment(ctx context.Context, taskID, content, replyToCommentID string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, postCall{taskID, content, replyToCommentID})
+	if f.returnErr != nil {
+		return "", f.returnErr
+	}
+	id := f.returnID
+	if id == "" {
+		id = "comment-posted"
+	}
+	return id, nil
+}
+
+var _ implementer.LarkClient = (*fakeLarkClient)(nil)
+
+// baseDepsWithLark builds Deps with a LarkClient injected.
+func baseDepsWithLark(db implementer.DBClient, wt implementer.WorktreeClient, spawn implementer.SpawnFunc, lc implementer.LarkClient) implementer.Deps {
+	d := baseDeps(db, wt, spawn)
+	d.LarkClient = lc
+	return d
+}
+
+// ---- inline post wiring tests ----
+
+// TestDispatchImplement_InlinePost_InsertedTrue: outbox inserted=true →
+// PostComment called once with correct args; content contains the headline.
+func TestDispatchImplement_InlinePost_InsertedTrue(t *testing.T) {
+	nightEnvOn(t)
+	db := newFakeDB()
+	lc := &fakeLarkClient{}
+	wt := &fakeWorktree{ensurePath: "/wt/task-lc", ensureBranch: "implement/task-lc-aabb"}
+	deps := baseDepsWithLark(db, wt, func(ctx context.Context, args implementer.GnhfArgs) (implementer.GnhfResult, error) {
+		return implementer.GnhfResult{
+			Status:       implementer.StatusStopped,
+			Reason:       implementer.ReasonStopWhen,
+			CommitCount:  1,
+			InputTokens:  200,
+			OutputTokens: 100,
+			Iterations:   3,
+		}, nil
+	}, lc)
+	row := makeRow("c-lc", "task-lc", "impl lc task", "autonomous")
+
+	if err := implementer.DispatchImplement(context.Background(), row, deps); err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+
+	lc.mu.Lock()
+	calls := lc.calls
+	lc.mu.Unlock()
+
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 PostComment call, got %d", len(calls))
+	}
+	call := calls[0]
+	if call.TaskID != row.TaskID {
+		t.Errorf("PostComment taskID: got %q want %q", call.TaskID, row.TaskID)
+	}
+	if call.ReplyToCommentID != row.CommentID {
+		t.Errorf("PostComment replyToCommentID: got %q want %q", call.ReplyToCommentID, row.CommentID)
+	}
+	if !strings.Contains(call.Content, "finished — stop-when condition met") {
+		t.Errorf("PostComment content missing headline, got: %q", call.Content)
+	}
+}
+
+// TestDispatchImplement_InlinePost_InsertedFalse: outbox inserted=false
+// (idempotent re-run) → PostComment must NOT be called.
+func TestDispatchImplement_InlinePost_InsertedFalse(t *testing.T) {
+	nightEnvOn(t)
+
+	// Configure fakeDB to return inserted=false on OutboxInsertPhased.
+	db := &fakeDBIdempotent{fakeDB: newFakeDB()}
+	lc := &fakeLarkClient{}
+	wt := &fakeWorktree{ensurePath: "/wt/task-idem", ensureBranch: "implement/task-idem-aabb"}
+	deps := baseDepsWithLark(db, wt, func(ctx context.Context, args implementer.GnhfArgs) (implementer.GnhfResult, error) {
+		return implementer.GnhfResult{
+			Status:      implementer.StatusStopped,
+			Reason:      implementer.ReasonStopWhen,
+			CommitCount: 1,
+		}, nil
+	}, lc)
+	row := makeRow("c-idem", "task-idem", "impl idem task", "autonomous")
+
+	if err := implementer.DispatchImplement(context.Background(), row, deps); err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+
+	lc.mu.Lock()
+	calls := lc.calls
+	lc.mu.Unlock()
+
+	if len(calls) != 0 {
+		t.Errorf("PostComment must not be called when outbox inserted=false (idempotent re-run), got %d calls", len(calls))
+	}
+}
+
+// fakeDBIdempotent wraps fakeDB but returns inserted=false from OutboxInsertPhased.
+type fakeDBIdempotent struct {
+	*fakeDB
+}
+
+func (f *fakeDBIdempotent) OutboxInsertPhased(ctx context.Context, commentID, taskID, replyTo, phase string) (bool, error) {
+	f.fakeDB.mu.Lock()
+	defer f.fakeDB.mu.Unlock()
+	f.fakeDB.outboxRows = append(f.fakeDB.outboxRows, outboxRow{commentID, taskID, replyTo, phase})
+	return false, nil // idempotent: row already existed
+}
+
+// TestDispatchImplement_InlinePost_PostError: PostComment returns error →
+// dispatch returns nil (error logged, not propagated); outbox row remains.
+func TestDispatchImplement_InlinePost_PostError(t *testing.T) {
+	nightEnvOn(t)
+	db := newFakeDB()
+	lc := &fakeLarkClient{returnErr: fmt.Errorf("lark network timeout")}
+	wt := &fakeWorktree{ensurePath: "/wt/task-pe", ensureBranch: "implement/task-pe-aabb"}
+	deps := baseDepsWithLark(db, wt, func(ctx context.Context, args implementer.GnhfArgs) (implementer.GnhfResult, error) {
+		return implementer.GnhfResult{
+			Status:      implementer.StatusStopped,
+			Reason:      implementer.ReasonStopWhen,
+			CommitCount: 1,
+		}, nil
+	}, lc)
+	row := makeRow("c-pe", "task-pe", "impl pe task", "autonomous")
+
+	err := implementer.DispatchImplement(context.Background(), row, deps)
+	if err != nil {
+		t.Fatalf("PostComment error must not propagate from DispatchImplement, got: %v", err)
+	}
+
+	// Outbox marker must still be present (not rolled back on post failure).
+	if len(db.outboxRows) != 1 {
+		t.Errorf("expected outbox row to remain after post failure, got %d rows", len(db.outboxRows))
+	}
+	// MarkInboxProcessed should still be called (pipeline continues).
+	if len(db.processedCalls) != 1 {
+		t.Errorf("expected MarkInboxProcessed after post error, got %d calls", len(db.processedCalls))
+	}
+}
+
+// TestDispatchImplement_InlinePost_NilLarkClient: LarkClient=nil →
+// dispatch must not panic; outbox row inserted, no post attempted.
+func TestDispatchImplement_InlinePost_NilLarkClient(t *testing.T) {
+	nightEnvOn(t)
+	db := newFakeDB()
+	wt := &fakeWorktree{ensurePath: "/wt/task-nil", ensureBranch: "implement/task-nil-aabb"}
+	// baseDeps leaves LarkClient as nil — existing tests rely on this behaviour.
+	deps := baseDeps(db, wt, func(ctx context.Context, args implementer.GnhfArgs) (implementer.GnhfResult, error) {
+		return implementer.GnhfResult{
+			Status:      implementer.StatusStopped,
+			Reason:      implementer.ReasonStopWhen,
+			CommitCount: 1,
+		}, nil
+	})
+
+	row := makeRow("c-nil", "task-nil", "impl nil task", "autonomous")
+	if err := implementer.DispatchImplement(context.Background(), row, deps); err != nil {
+		t.Fatalf("nil LarkClient must not cause error, got: %v", err)
+	}
+	assertOutboxMarker(t, db, row)
 }
