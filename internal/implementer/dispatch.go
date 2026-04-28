@@ -3,7 +3,6 @@ package implementer
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -80,33 +79,6 @@ func deriveOutcome(r GnhfResult) string {
 	default:
 		return "failed"
 	}
-}
-
-// outboxPayload is the stable JSON shape stored in the outbox for implement rows.
-// Task 6 will format this for Lark — the shape here is intentionally minimal.
-type outboxPayload struct {
-	Status       string `json:"status"`
-	Reason       string `json:"reason"`
-	NoProgress   bool   `json:"no_progress"`
-	BranchName   string `json:"branch_name"`
-	PRURL        string `json:"pr_url"`
-	CommitCount  int    `json:"commit_count"`
-	Iterations   int    `json:"iterations"`
-	InputTokens  int    `json:"input_tokens"`
-	OutputTokens int    `json:"output_tokens"`
-	NotesExcerpt string `json:"notes_excerpt,omitempty"`
-}
-
-// encodePayload serialises an outboxPayload to a JSON string.
-// On marshal failure a minimal fallback string is returned so the outbox row
-// is always written (Task 6 can detect the truncated format).
-func encodePayload(p outboxPayload) string {
-	b, err := json.Marshal(p)
-	if err != nil {
-		return fmt.Sprintf(`{"status":%q,"reason":%q,"commit_count":%d}`,
-			p.Status, p.Reason, p.CommitCount)
-	}
-	return string(b)
 }
 
 // tryOpenPR invokes `gh pr create` if IMPLEMENTER_AUTO_PR=true AND the run
@@ -256,20 +228,12 @@ func DispatchImplement(ctx context.Context, row sqlite.InboxRow, deps Deps) erro
 		// Non-fatal: continue so outbox and cleanup still execute.
 	}
 
-	// Step 8: Outbox row.
-	payload := encodePayload(outboxPayload{
-		Status:       string(result.Status),
-		Reason:       string(result.Reason),
-		NoProgress:   result.NoProgress,
-		BranchName:   branchName,
-		PRURL:        prURL,
-		CommitCount:  result.CommitCount,
-		Iterations:   result.Iterations,
-		InputTokens:  result.InputTokens,
-		OutputTokens: result.OutputTokens,
-		NotesExcerpt: result.NotesExcerpt,
-	})
-	if _, err := deps.DB.OutboxInsertPhased(ctx, payload, row.TaskID, row.CommentID, "implement"); err != nil {
+	// Step 8: Outbox row — phased intent marker only, NOT a payload store.
+	// The outbox table has no content column; it's a (comment_id, phase) dedup
+	// key so OutboxFlush knows a reply is owed. Task 6 composes the actual
+	// Lark reply body at flush time by reading implementer_runs via
+	// GetImplementerRunByCommentID.
+	if _, err := deps.DB.OutboxInsertPhased(ctx, row.CommentID, row.TaskID, row.CommentID, "implement"); err != nil {
 		log.Printf("dispatchImplement: OutboxInsertPhased %s: %v", row.CommentID, err)
 	}
 

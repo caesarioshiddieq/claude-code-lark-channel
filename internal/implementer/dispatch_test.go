@@ -162,6 +162,37 @@ func baseDeps(db implementer.DBClient, wt implementer.WorktreeClient, spawn impl
 	}
 }
 
+// assertOutboxMarker verifies that exactly one outbox row was inserted via
+// OutboxInsertPhased with the canonical phased-intent-marker arg shape:
+//
+//	(commentID = row.CommentID, taskID = row.TaskID,
+//	 replyTo  = row.CommentID, phase = "implement")
+//
+// The outbox table has no content column — Task 6 composes the actual Lark
+// reply at flush time by reading implementer_runs. So the test asserts only
+// that the marker is present and correctly addressed.
+func assertOutboxMarker(t *testing.T, db *fakeDB, row sqlite.InboxRow) {
+	t.Helper()
+	if len(db.outboxRows) != 1 {
+		t.Fatalf("expected 1 outbox marker row, got %d", len(db.outboxRows))
+	}
+	got := db.outboxRows[0]
+	if got.CommentID != row.CommentID {
+		t.Errorf("outbox commentID: got %q want %q (must equal row.CommentID, NOT a JSON payload)",
+			got.CommentID, row.CommentID)
+	}
+	if got.TaskID != row.TaskID {
+		t.Errorf("outbox taskID: got %q want %q", got.TaskID, row.TaskID)
+	}
+	if got.ReplyTo != row.CommentID {
+		t.Errorf("outbox replyTo: got %q want %q (replies into the same comment thread)",
+			got.ReplyTo, row.CommentID)
+	}
+	if got.Phase != "implement" {
+		t.Errorf("outbox phase: got %q want implement", got.Phase)
+	}
+}
+
 // ---- test cases ----
 
 // (a) Day-window CanSpawn=false → MarkDeferred called, no Spawn, no run row.
@@ -226,12 +257,7 @@ func TestDispatchImplement_Success(t *testing.T) {
 	if fin.TokensUsed != 1500 {
 		t.Errorf("tokens_used: got %d want 1500 (1000+500)", fin.TokensUsed)
 	}
-	if len(db.outboxRows) != 1 {
-		t.Errorf("expected 1 outbox row, got %d", len(db.outboxRows))
-	}
-	if db.outboxRows[0].Phase != "implement" {
-		t.Errorf("outbox phase: got %q want implement", db.outboxRows[0].Phase)
-	}
+	assertOutboxMarker(t, db, row)
 	// CommitCount=3 → worktree preserved (Cleanup called with success=true).
 	if len(wt.cleanupCalls) != 1 {
 		t.Fatalf("expected 1 Cleanup call, got %d", len(wt.cleanupCalls))
@@ -274,9 +300,7 @@ func TestDispatchImplement_Failed(t *testing.T) {
 	if len(wt.cleanupCalls) != 1 || wt.cleanupCalls[0].Success {
 		t.Errorf("expected Cleanup(success=false), calls=%v", wt.cleanupCalls)
 	}
-	if len(db.outboxRows) != 1 {
-		t.Errorf("expected 1 outbox row, got %d", len(db.outboxRows))
-	}
+	assertOutboxMarker(t, db, row)
 }
 
 // (d) StopWhen match but no commits → outcome="blocked", worktree cleaned.
@@ -305,6 +329,7 @@ func TestDispatchImplement_Blocked(t *testing.T) {
 	if len(wt.cleanupCalls) != 1 || wt.cleanupCalls[0].Success {
 		t.Errorf("expected Cleanup(success=false) for blocked, calls=%v", wt.cleanupCalls)
 	}
+	assertOutboxMarker(t, db, row)
 }
 
 // (e) NoProgress does NOT override Aborted: Status=Aborted, Reason=MaxTokens,
@@ -331,6 +356,7 @@ func TestDispatchImplement_Timeout_NoProgressDoesNotOverride(t *testing.T) {
 	if fin.Outcome != "timeout" {
 		t.Errorf("outcome: got %q want timeout (NoProgress must not override Aborted)", fin.Outcome)
 	}
+	assertOutboxMarker(t, db, row)
 }
 
 // (f) Spawn returns ErrIncompleteLog with synthesized result →
@@ -363,9 +389,7 @@ func TestDispatchImplement_ErrIncompleteLog(t *testing.T) {
 		t.Error("Error field must be non-empty for ErrIncompleteLog")
 	}
 	// Outbox and MarkProcessed should still be called even on incomplete log.
-	if len(db.outboxRows) != 1 {
-		t.Errorf("expected outbox row even on incomplete log, got %d", len(db.outboxRows))
-	}
+	assertOutboxMarker(t, db, row)
 	if len(db.processedCalls) != 1 {
 		t.Errorf("expected MarkInboxProcessed even on incomplete log, got %d", len(db.processedCalls))
 	}
