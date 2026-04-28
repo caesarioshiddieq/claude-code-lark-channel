@@ -3,7 +3,13 @@
 // spawn.go contains all OS interaction (exec, filesystem, signals).
 package implementer
 
-import "errors"
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"errors"
+	"strings"
+)
 
 // Status represents the final state of a gnhf run as reported in run:complete.
 type Status string
@@ -49,6 +55,53 @@ type GnhfResult struct {
 	LogIncomplete bool   // set when run:complete event was never written
 }
 
+// gnhfRunCompleteEvent is the JSON shape of a run:complete line in gnhf.log.
+type gnhfRunCompleteEvent struct {
+	Event             string `json:"event"`
+	Status            string `json:"status"`
+	Iterations        int    `json:"iterations"`
+	SuccessCount      int    `json:"successCount"`
+	FailCount         int    `json:"failCount"`
+	TotalInputTokens  int    `json:"totalInputTokens"`
+	TotalOutputTokens int    `json:"totalOutputTokens"`
+	CommitCount       int    `json:"commitCount"`
+	WorktreePath      string `json:"worktreePath"`
+	LastMessage       string `json:"lastMessage"`
+}
+
+// incompleteResult is the synthesized result returned when no run:complete
+// event is found — allows callers to persist implementer_runs without blocking.
+func incompleteResult() GnhfResult {
+	return GnhfResult{
+		Status:        StatusAborted,
+		Reason:        ReasonUnknown,
+		LastMessage:   "missing run:complete event",
+		LogIncomplete: true,
+	}
+}
+
+// deriveReason maps lastMessage substrings to a Reason constant.
+// For status=stopped, the stop-when condition match is signalled by the
+// "stop condition" substring that gnhf injects when its --stop-when predicate
+// is satisfied. All other stopped cases fall through to ReasonUnknown.
+func deriveReason(status Status, lastMessage string) Reason {
+	msg := strings.ToLower(lastMessage)
+	switch {
+	case strings.Contains(msg, "max iterations reached"):
+		return ReasonMaxIterations
+	case strings.Contains(msg, "max tokens reached"):
+		return ReasonMaxTokens
+	case strings.Contains(msg, "max consecutive failures"):
+		return ReasonMaxFailures
+	case strings.Contains(msg, "signal"):
+		return ReasonSignal
+	case status == StatusStopped && strings.Contains(msg, "stop condition"):
+		return ReasonStopWhen
+	default:
+		return ReasonUnknown
+	}
+}
+
 // ParseGnhfLog parses a gnhf JSONL log file and returns the run outcome.
 // It scans all lines, keeps the LAST run:complete event, and derives Reason
 // from LastMessage substrings.
@@ -58,10 +111,50 @@ type GnhfResult struct {
 // Reason=Unknown, LogIncomplete=true. This allows the caller to persist the
 // row and make retry decisions without blocking on a NULL outcome.
 func ParseGnhfLog(jsonl []byte) (GnhfResult, error) {
-	// stub — always returns incomplete to make RED tests fail on content
-	return GnhfResult{
-		Status:        StatusAborted,
-		Reason:        ReasonUnknown,
-		LogIncomplete: true,
-	}, ErrIncompleteLog
+	var last *gnhfRunCompleteEvent
+
+	scanner := bufio.NewScanner(bytes.NewReader(jsonl))
+	for scanner.Scan() {
+		line := bytes.TrimSpace(scanner.Bytes())
+		if len(line) == 0 {
+			continue
+		}
+		// Fast-path: only attempt full unmarshal for lines containing
+		// "run:complete" to avoid paying JSON decode cost on every iteration
+		// event. Uses bytes.Contains on raw line for efficiency.
+		if !bytes.Contains(line, []byte(`"run:complete"`)) {
+			continue
+		}
+		var ev gnhfRunCompleteEvent
+		if err := json.Unmarshal(line, &ev); err != nil {
+			continue // malformed line — skip; keep scanning
+		}
+		if ev.Event != "run:complete" {
+			continue // event field didn't match (e.g. "iteration:complete" containing the substring)
+		}
+		evCopy := ev
+		last = &evCopy
+	}
+
+	if last == nil {
+		return incompleteResult(), ErrIncompleteLog
+	}
+
+	status := Status(last.Status)
+	reason := deriveReason(status, last.LastMessage)
+
+	r := GnhfResult{
+		Status:       status,
+		Reason:       reason,
+		Iterations:   last.Iterations,
+		SuccessCount: last.SuccessCount,
+		FailCount:    last.FailCount,
+		CommitCount:  last.CommitCount,
+		InputTokens:  last.TotalInputTokens,
+		OutputTokens: last.TotalOutputTokens,
+		WorktreePath: last.WorktreePath,
+		LastMessage:  last.LastMessage,
+		NoProgress:   last.CommitCount == 0,
+	}
+	return r, nil
 }
