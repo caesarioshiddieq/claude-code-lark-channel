@@ -72,6 +72,22 @@ var migration0004 = []string{
 	`CREATE INDEX IF NOT EXISTS implementer_runs_comment_idx ON implementer_runs(inbox_comment_id)`,
 }
 
+// migration0005 adds gnhf-native outcome fields to implementer_runs.
+// The original outcome/tokens_used columns (migration0004) are kept as
+// derived legacy for backwards compatibility; Task 5 computes them at write
+// time from the new gnhf_* fields.
+var migration0005 = []string{
+	`ALTER TABLE implementer_runs ADD COLUMN gnhf_status        TEXT    NOT NULL DEFAULT ''`,
+	`ALTER TABLE implementer_runs ADD COLUMN gnhf_reason        TEXT    NOT NULL DEFAULT ''`,
+	`ALTER TABLE implementer_runs ADD COLUMN gnhf_success_count INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE implementer_runs ADD COLUMN gnhf_fail_count    INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE implementer_runs ADD COLUMN gnhf_input_tokens  INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE implementer_runs ADD COLUMN gnhf_output_tokens INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE implementer_runs ADD COLUMN gnhf_run_id        TEXT    NOT NULL DEFAULT ''`,
+	`ALTER TABLE implementer_runs ADD COLUMN gnhf_no_progress   INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE implementer_runs ADD COLUMN gnhf_last_message  TEXT    NOT NULL DEFAULT ''`,
+}
+
 func migrate(db *sql.DB) error {
 	if _, err := db.Exec(createMigrations); err != nil {
 		return fmt.Errorf("create migrations table: %w", err)
@@ -83,6 +99,7 @@ func migrate(db *sql.DB) error {
 		{2, migration0002},
 		{3, migration0003},
 		{4, migration0004},
+		{5, migration0005},
 	}
 	for _, m := range migrations {
 		var count int
