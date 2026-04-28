@@ -114,6 +114,12 @@ func ParseGnhfLog(jsonl []byte) (GnhfResult, error) {
 	var last *gnhfRunCompleteEvent
 
 	scanner := bufio.NewScanner(bytes.NewReader(jsonl))
+	// Default Scanner buffer is 64KB. A run:complete line with a long
+	// lastMessage (e.g. multi-line stack trace, large stop-condition output)
+	// could exceed it and silently truncate the stream — making this function
+	// incorrectly return ErrIncompleteLog (codex round-2 #2).
+	// 1MB initial / 16MB max accommodates realistic worst cases.
+	scanner.Buffer(make([]byte, 1<<20), 1<<24)
 	for scanner.Scan() {
 		line := bytes.TrimSpace(scanner.Bytes())
 		if len(line) == 0 {
@@ -134,6 +140,19 @@ func ParseGnhfLog(jsonl []byte) (GnhfResult, error) {
 		}
 		evCopy := ev
 		last = &evCopy
+	}
+
+	// Distinct from missing run:complete: scanner.Err() reports buffer overflow
+	// or read-side failures. Treat as incomplete log so the dispatcher persists
+	// a synthesized result, but with a more specific LastMessage so operators
+	// can distinguish "log truncated by gnhf" from "log unparseable by us".
+	if err := scanner.Err(); err != nil {
+		return GnhfResult{
+			Status:        StatusAborted,
+			Reason:        ReasonUnknown,
+			LastMessage:   "log scanner error: " + err.Error(),
+			LogIncomplete: true,
+		}, ErrIncompleteLog
 	}
 
 	if last == nil {
