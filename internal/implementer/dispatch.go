@@ -185,21 +185,21 @@ func DispatchImplement(ctx context.Context, row sqlite.InboxRow, deps Deps) erro
 		return fmt.Errorf("dispatchImplement: InsertImplementerRun: %w", err)
 	}
 
-	// Capture ceiling values before Spawn so we can pass identical knobs to
-	// FormatImplementerSummary after the run completes. applyDefaults fills any
-	// zero field, so we mirror its logic here to get the resolved values without
-	// a second call. MaxTokens=0 means unbounded (omit --max-tokens flag).
-	spawnMaxIterations := defaultMaxIterations
-	var spawnMaxTokens int64 // 0 = unbounded
-
-	// Step 5: Spawn gnhf subprocess.
-	result, spawnErr := deps.Spawn(ctx, GnhfArgs{
+	// Resolve ceiling values via ApplyDefaults so the formatter sees the exact
+	// same knobs gnhf will see — single source of truth in spawn.go. Future
+	// env-tunable overrides added to ApplyDefaults flow through here automatically.
+	// ApplyDefaults is idempotent; SpawnGnhf calls it again internally (no-op).
+	args := GnhfArgs{
 		Prompt:         row.Content,
 		WorktreePath:   wtPath,
 		ExpectedBranch: branchName,
-		MaxIterations:  spawnMaxIterations,
-		MaxTokens:      spawnMaxTokens,
-	})
+	}
+	ApplyDefaults(&args)
+	spawnMaxIterations := args.MaxIterations
+	spawnMaxTokens := args.MaxTokens // 0 = unbounded (no allowance line)
+
+	// Step 5: Spawn gnhf subprocess.
+	result, spawnErr := deps.Spawn(ctx, args)
 
 	// Step 6: Derive outcome and finalize run row.
 	// For ErrIncompleteLog/*ErrAmbiguousRunDir the result is a usable synthesized
@@ -244,6 +244,8 @@ func DispatchImplement(ctx context.Context, row sqlite.InboxRow, deps Deps) erro
 
 	// Inject the finalize timestamp from the dispatcher's clock so it stays
 	// consistent with started_at and tests can assert determinism.
+	// finished_at is in milliseconds to match migration0004's contract;
+	// started_at uses Unix() — known schema quirk inherited from Task 1.
 	fin.FinishedAt = now.UnixMilli()
 
 	if err := deps.DB.FinalizeImplementerRun(ctx, runID, fin); err != nil {
