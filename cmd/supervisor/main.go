@@ -214,13 +214,7 @@ func processOne(ctx context.Context, db *sqlite.DB, client *lark.Client, maxTurn
 		}
 		return
 	}
-	// Use a closure so the implement case can set lockFile=nil to signal that
-	// it already released the lock (DispatchImplement acquires its own).
-	defer func() {
-		if lockFile != nil {
-			worker.UnlockTask(lockFile)
-		}
-	}()
+	defer worker.UnlockTask(lockFile)
 
 	// resolveSession is only needed for phases that drive a Claude session
 	// (answer/compact/normal). The implement phase manages its own worktree
@@ -245,11 +239,11 @@ func processOne(ctx context.Context, db *sqlite.DB, client *lark.Client, maxTurn
 	case "compact":
 		dispatchCompact(ctx, db, client, row, sessionUUID)
 	case "implement":
-		// Release the processOne flock before handing off — DispatchImplement
-		// acquires its own flock internally. Holding both simultaneously on the
-		// same taskID would deadlock if the same task is dispatched concurrently.
-		worker.UnlockTask(lockFile)
-		lockFile = nil // prevent the deferred UnlockTask from double-releasing
+		// HOLD the outer processOne flock through DispatchImplement. The inner
+		// LockTask was removed (codex review #2): a release/reacquire handoff
+		// leaves a window where another supervisor process could grab the same
+		// comment and double-run. The deferred UnlockTask in processOne releases
+		// the lock when this case returns.
 		repoPath := os.Getenv("IMPLEMENTER_DEFAULT_REPO")
 		deps := implementer.Deps{
 			DB:         db,
@@ -262,6 +256,12 @@ func processOne(ctx context.Context, db *sqlite.DB, client *lark.Client, maxTurn
 		}
 		if err := implementer.DispatchImplement(ctx, row, deps); err != nil {
 			log.Printf("dispatchImplement %s: %v", row.CommentID, err)
+			// Fast-fail backoff: persistent DB/worktree errors would otherwise
+			// re-queue this row instantly and tight-spin the dispatcher.
+			// Mirrors processOne's LockTask/resolveSession fast-fail paths.
+			if markErr := db.MarkDeferred(ctx, row.CommentID, fastFailBackoff().UnixMilli(), row.Content); markErr != nil {
+				log.Printf("dispatchImplement: MarkDeferred (fast-fail): %v", markErr)
+			}
 		}
 	default:
 		dispatchNormal(ctx, db, client, row, sessionUUID, isNew, maxTurns)

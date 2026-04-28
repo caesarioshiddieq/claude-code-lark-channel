@@ -133,8 +133,8 @@ func makeRow(commentID, taskID, content, source string) sqlite.InboxRow {
 
 // nightEnvOn forces CanSpawn to allow autonomous spawns by setting the night
 // window to cover the full 24-hour clock (NIGHT_START=0, NIGHT_END=23).
-// Also sets LOCK_DIR to a temp directory so LockTask succeeds in tests
-// without needing /var/lib/claude-vm/sessions to exist.
+// LOCK_DIR is set defensively in case any indirect helper still touches it,
+// even though DispatchImplement no longer acquires its own flock (codex #2).
 func nightEnvOn(t *testing.T) {
 	t.Helper()
 	t.Setenv("NIGHT_START", "0")
@@ -678,4 +678,68 @@ func TestDispatchImplement_InlinePost_NilLarkClient(t *testing.T) {
 		t.Fatalf("nil LarkClient must not cause error, got: %v", err)
 	}
 	assertOutboxMarker(t, db, row)
+}
+
+// TestDispatchImplement_FinishedAtAfterStartedAt verifies that finished_at
+// is captured AFTER Spawn returns (a fresh deps.Now() call), not from the
+// captured `now` at function entry. Regression test for the codex review #1
+// finding: reusing `now` for both timestamps would set duration = 0 even
+// when spawn took minutes/hours.
+func TestDispatchImplement_FinishedAtAfterStartedAt(t *testing.T) {
+	nightEnvOn(t)
+
+	// Synthetic clock: each call advances by 1 second. The dispatcher calls
+	// deps.Now() at entry (started_at) and again after Spawn returns
+	// (finished_at) — at minimum 2 calls. With a per-call advance, the
+	// difference is provable regardless of wall-clock jitter.
+	base := time.Date(2026, 4, 28, 22, 0, 0, 0, time.UTC)
+	var nowCallCount int
+	clock := func() time.Time {
+		nowCallCount++
+		return base.Add(time.Duration(nowCallCount) * time.Second)
+	}
+
+	db := newFakeDB()
+	wt := &fakeWorktree{ensurePath: "/wt/task-clock", ensureBranch: "implement/task-clock-aabb"}
+	deps := implementer.Deps{
+		DB:       db,
+		Worktree: wt,
+		Spawn: func(ctx context.Context, args implementer.GnhfArgs) (implementer.GnhfResult, error) {
+			// Simulate spawn-elapsed time by advancing the clock once during Spawn.
+			// (In production this is real elapsed wall time across SpawnGnhf.)
+			_ = clock()
+			return implementer.GnhfResult{
+				Status:       implementer.StatusStopped,
+				Reason:       implementer.ReasonStopWhen,
+				CommitCount:  1,
+				InputTokens:  100,
+				OutputTokens: 50,
+			}, nil
+		},
+		RepoPath:  "/repo",
+		Now:       clock,
+		JitterMin: 0,
+	}
+
+	row := makeRow("c-clock", "task-clock", "impl clock task", "autonomous")
+	if err := implementer.DispatchImplement(context.Background(), row, deps); err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+
+	if len(db.insertedRuns) != 1 {
+		t.Fatalf("expected 1 inserted run, got %d", len(db.insertedRuns))
+	}
+	if len(db.finalizedRuns) != 1 {
+		t.Fatalf("expected 1 finalized run, got %d", len(db.finalizedRuns))
+	}
+	startedAt := db.insertedRuns[0].StartedAt    // seconds
+	finishedAt := db.finalizedRuns[1].FinishedAt // milliseconds
+
+	// finished_at (ms) must be strictly greater than started_at (s) converted
+	// to ms — i.e., the dispatcher captured a FRESH timestamp after Spawn.
+	startedAtMs := startedAt * 1000
+	if finishedAt <= startedAtMs {
+		t.Errorf("finished_at must be after started_at: started_at=%d s (%d ms), finished_at=%d ms — same `now` reused?",
+			startedAt, startedAtMs, finishedAt)
+	}
 }
