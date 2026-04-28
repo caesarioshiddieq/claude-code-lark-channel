@@ -278,31 +278,38 @@ func TestFormatImplementerSummary(t *testing.T) {
 
 // TestFormatImplementerSummary_LogIncomplete_AllRows verifies that the
 // " ⚠ log incomplete" suffix appears regardless of which base row matched.
+// Single 8-row table covers all (Status, Reason, NoProgress) combinations
+// from the Task 6 spec — names match the spec's row ordering for readability.
 func TestFormatImplementerSummary_LogIncomplete_AllRows(t *testing.T) {
 	t.Parallel()
 
 	type rowCase struct {
-		status implementer.Status
-		reason implementer.Reason
+		name       string
+		status     implementer.Status
+		reason     implementer.Reason
+		noProgress bool
+		wantBase   string
 	}
 
 	rows := []rowCase{
-		{implementer.StatusStopped, implementer.ReasonStopWhen},
-		{implementer.StatusStopped, implementer.ReasonUnknown},
-		{implementer.StatusAborted, implementer.ReasonMaxIterations},
-		{implementer.StatusAborted, implementer.ReasonMaxTokens},
-		{implementer.StatusAborted, implementer.ReasonMaxFailures},
-		{implementer.StatusAborted, implementer.ReasonSignal},
-		{implementer.StatusAborted, implementer.ReasonUnknown},
+		{"row1_stopped_stopwhen_progress", implementer.StatusStopped, implementer.ReasonStopWhen, false, "finished — stop-when condition met"},
+		{"row2_stopped_stopwhen_noprogress", implementer.StatusStopped, implementer.ReasonStopWhen, true, "halted — stop-when matched but no commits made"},
+		{"row3_stopped_unknown", implementer.StatusStopped, implementer.ReasonUnknown, false, "stopped — orchestrator returned without explicit reason"},
+		{"row4_aborted_maxiterations", implementer.StatusAborted, implementer.ReasonMaxIterations, false, "timed out — max iterations reached"},
+		{"row5_aborted_maxtokens", implementer.StatusAborted, implementer.ReasonMaxTokens, false, "timed out — token ceiling reached"},
+		{"row6_aborted_maxfailures", implementer.StatusAborted, implementer.ReasonMaxFailures, false, "failed — max consecutive iteration failures"},
+		{"row7_aborted_signal", implementer.StatusAborted, implementer.ReasonSignal, false, "interrupted — supervisor cancelled"},
+		{"row8_aborted_unknown", implementer.StatusAborted, implementer.ReasonUnknown, false, "aborted — see notes for context"},
 	}
 
 	for _, row := range rows {
 		row := row
-		t.Run(string(row.status)+"_"+string(row.reason)+"_logincomplete", func(t *testing.T) {
+		t.Run(row.name+"_logincomplete", func(t *testing.T) {
 			t.Parallel()
 			r := implementer.GnhfResult{
 				Status:        row.status,
 				Reason:        row.reason,
+				NoProgress:    row.noProgress,
 				LogIncomplete: true,
 				Iterations:    3,
 				CommitCount:   1,
@@ -310,27 +317,11 @@ func TestFormatImplementerSummary_LogIncomplete_AllRows(t *testing.T) {
 				OutputTokens:  50,
 			}
 			got := implementer.FormatImplementerSummary(r, "implement/test", "", 30, 0)
-			if !strings.Contains(got, "⚠ log incomplete") {
-				t.Errorf("LogIncomplete=true but suffix not found in output:\n%s", got)
+
+			wantSuffix := row.wantBase + " ⚠ log incomplete"
+			if !strings.Contains(got, wantSuffix) {
+				t.Errorf("expected headline+suffix %q not found in output:\n%s", wantSuffix, got)
 			}
 		})
 	}
-
-	// Also test stopped/stop_when/NoProgress=true with LogIncomplete
-	t.Run("stopped_stopwhen_noprogress_logincomplete", func(t *testing.T) {
-		t.Parallel()
-		r := implementer.GnhfResult{
-			Status:        implementer.StatusStopped,
-			Reason:        implementer.ReasonStopWhen,
-			NoProgress:    true,
-			LogIncomplete: true,
-		}
-		got := implementer.FormatImplementerSummary(r, "implement/test", "", 30, 0)
-		if !strings.Contains(got, "⚠ log incomplete") {
-			t.Errorf("LogIncomplete=true (stopped/stop_when/noprogress) suffix not found:\n%s", got)
-		}
-		if !strings.Contains(got, "halted — stop-when matched but no commits made") {
-			t.Errorf("expected halted headline, got:\n%s", got)
-		}
-	})
 }

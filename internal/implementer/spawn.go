@@ -50,8 +50,16 @@ const (
 	notesExcerptMax      = 512
 )
 
-// applyDefaults fills zero-value fields with their documented defaults.
-func applyDefaults(args *GnhfArgs) {
+// ApplyDefaults fills zero-value fields with their documented defaults. It is
+// the single source of truth for resolved knob values (MaxIterations, StopWhen,
+// Agent, Timeout, GracePeriod) and is idempotent: calling twice on the same
+// args is a no-op. Exported so callers (e.g. DispatchImplement) can pre-resolve
+// knobs before Spawn to keep the formatter in sync with what gnhf actually saw,
+// without duplicating the default-filling logic.
+//
+// MaxTokens intentionally has no default — 0 means unbounded (omit
+// --max-tokens flag).
+func ApplyDefaults(args *GnhfArgs) {
 	if args.MaxIterations == 0 {
 		args.MaxIterations = defaultMaxIterations
 	}
@@ -271,7 +279,7 @@ func resolveRunDir(runsBase string, newDirs []string) (string, error) {
 //   - MaxTokens: optional (0 = omit --max-tokens flag).
 //   - MaxIterations / Agent / StopWhen / Timeout / GracePeriod: zero values
 //     are replaced with defaults (30 / "claude" / a generic stop-when string /
-//     4h / 30s) by applyDefaults.
+//     4h / 30s) by ApplyDefaults.
 //
 // Errors returned (always paired with a usable GnhfResult — see contract):
 //   - preflight failures (missing path, not a worktree, detached HEAD, branch
@@ -297,7 +305,7 @@ func resolveRunDir(runsBase string, newDirs []string) (string, error) {
 // SIGTERM is sent to the gnhf process group, args.GracePeriod is allowed for
 // the orchestrator to flush its run:complete event, then SIGKILL fires.
 func SpawnGnhf(ctx context.Context, args GnhfArgs) (GnhfResult, error) {
-	applyDefaults(&args)
+	ApplyDefaults(&args)
 
 	// Step 1: Preflight
 	if err := preflight(ctx, args); err != nil {
