@@ -101,32 +101,40 @@ func preflight(ctx context.Context, args GnhfArgs) error {
 }
 
 // commonGitDir resolves the common git directory for the worktree at wtPath.
-// For a linked worktree, git rev-parse --git-common-dir returns the parent
-// repo's .git directory. For the main worktree itself it returns ".git".
+// For a linked worktree, --git-common-dir returns the parent repo's .git
+// directory (where the shared objects/info live); for the main worktree it
+// equals --absolute-git-dir.
+//
+// Implementation note: a single `git rev-parse --absolute-git-dir
+// --git-common-dir` invocation returns both values on consecutive stdout
+// lines, halving the fork overhead vs. two separate calls. We keep
+// --absolute-git-dir as a structural sanity check (its failure indicates the
+// worktree is broken or git is unavailable).
+//
+// No fallback on --git-common-dir failure: the per-worktree .git is a
+// reference *file* (not a directory), so joining "info/exclude" onto it would
+// silently corrupt git metadata when os.MkdirAll creates the parent path.
 func commonGitDir(ctx context.Context, wtPath string) (string, error) {
 	out, err := exec.CommandContext(ctx, "git", "-C", wtPath,
-		"rev-parse", "--absolute-git-dir").Output()
+		"rev-parse", "--absolute-git-dir", "--git-common-dir").Output()
 	if err != nil {
-		return "", fmt.Errorf("rev-parse --absolute-git-dir: %w", err)
+		return "", fmt.Errorf("rev-parse --absolute-git-dir --git-common-dir: %w", err)
 	}
-	gitDir := strings.TrimSpace(string(out))
-
-	// For a linked worktree .git is a file; the common dir is the parent.
-	// git rev-parse --git-common-dir gives us the shared objects dir directly.
-	out2, err := exec.CommandContext(ctx, "git", "-C", wtPath,
-		"rev-parse", "--git-common-dir").Output()
-	if err != nil {
-		// Fallback: use the absolute git dir
-		return gitDir, nil
+	lines := strings.Split(strings.TrimRight(string(out), "\n"), "\n")
+	if len(lines) < 2 {
+		return "", fmt.Errorf("rev-parse: expected 2 lines, got %d: %q", len(lines), out)
 	}
-	common := strings.TrimSpace(string(out2))
+	common := strings.TrimSpace(lines[1])
+	if common == "" {
+		return "", fmt.Errorf("rev-parse --git-common-dir: empty output")
+	}
 	if filepath.IsAbs(common) {
 		return common, nil
 	}
-	// Relative path is relative to the worktree
+	// Relative path is relative to the worktree's cwd.
 	abs, err := filepath.Abs(filepath.Join(wtPath, common))
 	if err != nil {
-		return gitDir, nil
+		return "", fmt.Errorf("resolve relative common dir %q: %w", common, err)
 	}
 	return abs, nil
 }
@@ -251,7 +259,43 @@ func resolveRunDir(runsBase string, newDirs []string) (string, error) {
 
 // SpawnGnhf runs gnhf as a subprocess inside args.WorktreePath, waits for it
 // to complete (respecting ctx and args.Timeout), discovers the run directory
-// via name-set diff, and returns the parsed GnhfResult.
+// via name-set diff against a pre-spawn snapshot, parses the resulting
+// gnhf.log, and returns the populated GnhfResult.
+//
+// Argument semantics:
+//   - WorktreePath: required. Becomes cmd.Dir; must already be a git worktree
+//     with a non-detached HEAD. Validated by preflight.
+//   - Prompt: required. Delivered on the gnhf process's stdin.
+//   - ExpectedBranch: optional. When non-empty, preflight verifies HEAD's
+//     branch matches; mismatch is a hard error before any spawn.
+//   - MaxTokens: optional (0 = omit --max-tokens flag).
+//   - MaxIterations / Agent / StopWhen / Timeout / GracePeriod: zero values
+//     are replaced with defaults (30 / "claude" / a generic stop-when string /
+//     4h / 30s) by applyDefaults.
+//
+// Errors returned (always paired with a usable GnhfResult — see contract):
+//   - preflight failures (missing path, not a worktree, detached HEAD, branch
+//     mismatch): plain wrapped errors; GnhfResult is the zero value
+//   - ErrIncompleteLog: gnhf exited but no parseable run:complete event was
+//     found in gnhf.log (or gnhf.log was missing entirely — e.g. SIGKILL hit
+//     before flush). GnhfResult is synthesized as
+//     (Aborted, Unknown, LogIncomplete=true).
+//   - *ErrAmbiguousRunDir: multiple new run directories appeared and either
+//     zero or >1 contain a parseable run:complete. GnhfResult is synthesized
+//     with LogIncomplete=true; Candidates lists the offending dir names.
+//   - ErrRunDirNotFound: gnhf exited but no new directory appeared under
+//     .gnhf/runs/. GnhfResult is synthesized as
+//     (Aborted, Unknown, LogIncomplete=true).
+//
+// Contract: with the single exception of preflight failures, SpawnGnhf
+// always returns a usable GnhfResult — even when the error is non-nil. Task 5
+// (the dispatcher) can persist the implementer_runs row from the returned
+// struct without inspecting the error type, then use the error to decide
+// retry policy.
+//
+// Cancellation: ctx.Done or args.Timeout triggers a graceful shutdown:
+// SIGTERM is sent to the gnhf process group, args.GracePeriod is allowed for
+// the orchestrator to flush its run:complete event, then SIGKILL fires.
 func SpawnGnhf(ctx context.Context, args GnhfArgs) (GnhfResult, error) {
 	applyDefaults(&args)
 
@@ -260,10 +304,12 @@ func SpawnGnhf(ctx context.Context, args GnhfArgs) (GnhfResult, error) {
 		return GnhfResult{}, err
 	}
 
-	// Step 2: Ensure .gnhf/ is in the common git exclude file
+	// Step 2: Ensure .gnhf/ is in the common git exclude file.
+	// Non-fatal: if the write fails (e.g. worktree raced away between
+	// preflight and now, or info/ is unwritable), gnhf still runs, but we
+	// surface the warning to stderr so the operator can investigate.
 	if err := ensureGnhfExcluded(ctx, args.WorktreePath); err != nil {
-		// Non-fatal: log only; don't abort the spawn
-		_ = err
+		fmt.Fprintf(os.Stderr, "warn: ensureGnhfExcluded: %v\n", err)
 	}
 
 	// Step 3: Snapshot pre-spawn run dirs

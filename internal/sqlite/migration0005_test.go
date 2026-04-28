@@ -79,7 +79,18 @@ func TestMigration0005_BackfillsZeros(t *testing.T) {
 	raw := db.RawDB()
 
 	// Insert a row using only the migration0004 columns to simulate a pre-0005
-	// row. Omit the new columns entirely.
+	// row. Omit the migration0005 columns entirely so SQLite must apply their
+	// DEFAULT values.
+	//
+	// Column provenance (left-to-right in the INSERT below):
+	//   - migration0004 (CREATE TABLE):
+	//       inbox_comment_id, task_id, started_at, outcome, gnhf_iterations,
+	//       gnhf_commits_made, tokens_used, worktree_path, branch_name,
+	//       pr_url, notes_md_excerpt, error
+	//   - migration0005 (ALTER TABLE — NOT referenced here, intentionally):
+	//       gnhf_status, gnhf_reason, gnhf_success_count, gnhf_fail_count,
+	//       gnhf_input_tokens, gnhf_output_tokens, gnhf_run_id,
+	//       gnhf_no_progress, gnhf_last_message
 	_, err := raw.Exec(`INSERT INTO implementer_runs
 		(inbox_comment_id, task_id, started_at, outcome, gnhf_iterations, gnhf_commits_made,
 		 tokens_used, worktree_path, branch_name, pr_url, notes_md_excerpt, error)
