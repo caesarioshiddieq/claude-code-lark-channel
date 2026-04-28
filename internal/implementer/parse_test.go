@@ -2,6 +2,7 @@ package implementer_test
 
 import (
 	"errors"
+	"strconv"
 	"testing"
 
 	"github.com/caesarioshiddieq/claude-code-lark-channel/internal/implementer"
@@ -10,23 +11,11 @@ import (
 // makeRunComplete builds a minimal valid run:complete JSONL line.
 func makeRunComplete(status, lastMessage string, iterations, successCount, failCount, commitCount, inputTokens, outputTokens int) string {
 	return `{"event":"run:complete","status":"` + status + `","iterations":` +
-		itoa(iterations) + `,"successCount":` + itoa(successCount) +
-		`,"failCount":` + itoa(failCount) + `,"totalInputTokens":` +
-		itoa(inputTokens) + `,"totalOutputTokens":` + itoa(outputTokens) +
-		`,"commitCount":` + itoa(commitCount) + `,"worktreePath":"/tmp/wt","lastMessage":"` +
+		strconv.Itoa(iterations) + `,"successCount":` + strconv.Itoa(successCount) +
+		`,"failCount":` + strconv.Itoa(failCount) + `,"totalInputTokens":` +
+		strconv.Itoa(inputTokens) + `,"totalOutputTokens":` + strconv.Itoa(outputTokens) +
+		`,"commitCount":` + strconv.Itoa(commitCount) + `,"worktreePath":"/tmp/wt","lastMessage":"` +
 		lastMessage + `"}`
-}
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	b := make([]byte, 0, 10)
-	for n > 0 {
-		b = append([]byte{byte('0' + n%10)}, b...)
-		n /= 10
-	}
-	return string(b)
 }
 
 func TestParseGnhfLog_StoppedStopWhen(t *testing.T) {
