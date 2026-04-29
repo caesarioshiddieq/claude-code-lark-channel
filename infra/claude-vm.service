@@ -2,6 +2,17 @@
 Description=Claude Code VM Multi-Session Supervisor
 After=network.target
 
+# Environment vars are loaded from EnvironmentFile (see below). New vars
+# introduced by the autonomous-implementer subsystem (consumed by the
+# supervisor's implementer dispatch path):
+#   IMPLEMENTER_DEFAULT_REPO   — path to the managed git repo on disk
+#   IMPLEMENTER_WORKTREE_BASE  — root dir for per-task worktrees
+#                                (default: /var/lib/claude-vm/worktrees)
+#   IMPLEMENTER_AUTO_PR        — "true" to invoke `gh pr create` after a
+#                                successful run; "false" (default) leaves
+#                                PR creation to the operator
+# See infra/env.example for the full list and defaults.
+
 [Service]
 Type=simple
 User=caesario
@@ -14,6 +25,11 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=claude-vm
 LimitNOFILE=65536
+
+# Filesystem access. The supervisor needs to create per-task git worktrees
+# under IMPLEMENTER_WORKTREE_BASE; without ReadWritePaths the unit's default
+# ProtectSystem hardening would block writes there.
+ReadWritePaths=/var/lib/claude-vm /var/lib/claude-vm/worktrees
 
 [Install]
 WantedBy=multi-user.target
