@@ -285,6 +285,10 @@ func TestDispatchImplement_DayWindow_Deferred(t *testing.T) {
 		spawnCalled = true
 		return implementer.GnhfResult{}, nil
 	})
+	// Pin Now() to 12:00 UTC — guaranteed outside the 22-06 night window
+	// regardless of when the test actually runs. Without this, the test failed
+	// any time the wall clock landed inside 22-06 UTC (e.g. 04:55 UTC).
+	deps.Now = func() time.Time { return time.Date(2026, 4, 28, 12, 0, 0, 0, time.UTC) }
 	row := makeRow("c1", "task-1", "implement feature X", "autonomous")
 
 	err := implementer.DispatchImplement(context.Background(), row, deps)
