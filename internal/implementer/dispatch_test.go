@@ -815,15 +815,14 @@ func TestDispatchImplement_FinishedAtAfterStartedAt(t *testing.T) {
 	if len(db.finalizedRuns) != 1 {
 		t.Fatalf("expected 1 finalized run, got %d", len(db.finalizedRuns))
 	}
-	startedAt := db.insertedRuns[0].StartedAt    // seconds
+	startedAt := db.insertedRuns[0].StartedAt    // milliseconds (post unit-fix)
 	finishedAt := db.finalizedRuns[1].FinishedAt // milliseconds
 
-	// finished_at (ms) must be strictly greater than started_at (s) converted
-	// to ms — i.e., the dispatcher captured a FRESH timestamp after Spawn.
-	startedAtMs := startedAt * 1000
-	if finishedAt <= startedAtMs {
-		t.Errorf("finished_at must be after started_at: started_at=%d s (%d ms), finished_at=%d ms — same `now` reused?",
-			startedAt, startedAtMs, finishedAt)
+	// Both columns store UnixMilli; finished_at must be strictly greater than
+	// started_at — i.e., the dispatcher captured a FRESH timestamp after Spawn.
+	if finishedAt <= startedAt {
+		t.Errorf("finished_at must be after started_at: started_at=%d ms, finished_at=%d ms — same `now` reused?",
+			startedAt, finishedAt)
 	}
 }
 

@@ -358,10 +358,12 @@ func DispatchImplement(ctx context.Context, row sqlite.InboxRow, deps Deps) erro
 	// Reuse the captured `now` for started_at — this records WHEN dispatch began,
 	// before the spawn-elapsed time is added. finished_at uses a FRESH deps.Now()
 	// after Spawn returns, so the duration (finished_at - started_at) is correct.
+	// Both columns are stored as UnixMilli so finished_at - started_at returns
+	// elapsed milliseconds directly, with no unit conversion needed.
 	runID, err := deps.DB.InsertImplementerRun(ctx, sqlite.ImplementerRun{
 		InboxCommentID: row.CommentID,
 		TaskID:         row.TaskID,
-		StartedAt:      now.Unix(),
+		StartedAt:      now.UnixMilli(),
 		WorktreePath:   wtPath,
 		BranchName:     branchName,
 	})
@@ -428,8 +430,7 @@ func DispatchImplement(ctx context.Context, row sqlite.InboxRow, deps Deps) erro
 	// Inject the finalize timestamp from a FRESH deps.Now() call — NOT the
 	// captured `now` at function entry. Spawn can run for minutes/hours; reusing
 	// `now` would record finished_at == started_at and lose the elapsed duration.
-	// Schema quirk inherited from migration0004: started_at uses Unix() (seconds),
-	// finished_at uses UnixMilli() (milliseconds).
+	// Both columns store UnixMilli so finished_at - started_at gives elapsed ms.
 	fin.FinishedAt = deps.Now().UnixMilli()
 
 	if err := deps.DB.FinalizeImplementerRun(ctx, runID, fin); err != nil {

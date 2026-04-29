@@ -16,6 +16,7 @@ import (
 	"github.com/caesarioshiddieq/claude-code-lark-channel/internal/echo"
 	"github.com/caesarioshiddieq/claude-code-lark-channel/internal/gc"
 	"github.com/caesarioshiddieq/claude-code-lark-channel/internal/implementer"
+	"github.com/caesarioshiddieq/claude-code-lark-channel/internal/intent"
 	"github.com/caesarioshiddieq/claude-code-lark-channel/internal/lark"
 	sqlite "github.com/caesarioshiddieq/claude-code-lark-channel/internal/sqlite"
 	"github.com/caesarioshiddieq/claude-code-lark-channel/internal/worker"
@@ -132,7 +133,14 @@ func pollTask(ctx context.Context, client *lark.Client, db *sqlite.DB, taskID st
 			if watermark != "" && c.CommentID <= watermark {
 				continue
 			}
-			if err := db.InsertHumanInbox(ctx, taskID, c); err != nil {
+			// Classify before insert so phase is set atomically with the row,
+			// avoiding any window where the worker could pick up the row as
+			// phase=normal before a post-insert UpdateInboxPhase fires.
+			phase := string(intent.Classify(c.Content))
+			if phase == string(intent.PhaseImplement) {
+				log.Printf("[poller] WARN classifier picked phase=implement for task=%s comment=%s", taskID, c.CommentID)
+			}
+			if err := db.InsertHumanInbox(ctx, taskID, c, phase); err != nil {
 				log.Printf("[poller] insert inbox task=%s comment=%s: %v", taskID, c.CommentID, err)
 			}
 			if latestID == "" || c.CommentID > latestID {
