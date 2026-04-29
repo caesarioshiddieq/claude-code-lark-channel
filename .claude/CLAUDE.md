@@ -23,7 +23,7 @@ MAX_CONCURRENT_SPAWNS_GLOBAL — cross-task concurrent claude -p spawns (default
 ## Autonomous implementer env vars (gnhf subsystem)
 IMPLEMENTER_DEFAULT_REPO — path to the managed git repo (required for phase=implement rows)
 IMPLEMENTER_WORKTREE_BASE — root dir for per-task worktrees (default: /var/lib/claude-vm/worktrees)
-IMPLEMENTER_AUTO_PR — "true" to auto-`gh pr create` on success (default: false; flip after 2-week canary)
+IMPLEMENTER_AUTO_PR — "true" (default) to auto-`gh pr create` on success+commits; "false" leaves the worktree for manual PR
 GNHF_BIN — informational; supervisor uses PATH lookup (default install: /usr/local/bin/gnhf)
 
 NOT yet wired (defaults hard-coded in internal/implementer/spawn.go; M3 follow-up):
