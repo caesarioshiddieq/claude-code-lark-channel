@@ -245,6 +245,18 @@ func processOne(ctx context.Context, db *sqlite.DB, client *lark.Client, maxTurn
 		// comment and double-run. The deferred UnlockTask in processOne releases
 		// the lock when this case returns.
 		repoPath := os.Getenv("IMPLEMENTER_DEFAULT_REPO")
+		if repoPath == "" {
+			// Fast-fail: an empty repo path silently passes through to
+			// `git -C ""`, which uses the supervisor's cwd (/home/caesario per
+			// the systemd unit) — almost never a git repo, and always wrong.
+			// Defer the row with the same backoff as other fast-fail paths so
+			// the dispatcher doesn't tight-spin while the operator fixes the env.
+			log.Printf("dispatchImplement %s: IMPLEMENTER_DEFAULT_REPO is empty; cannot process implement rows (deferring)", row.CommentID)
+			if markErr := db.MarkDeferred(ctx, row.CommentID, fastFailBackoff().UnixMilli(), row.Content); markErr != nil {
+				log.Printf("dispatchImplement: MarkDeferred (empty repo): %v", markErr)
+			}
+			return
+		}
 		deps := implementer.Deps{
 			DB:         db,
 			Worktree:   worktree.New(repoPath, ""),
@@ -442,6 +454,13 @@ func main() {
 	}
 	budget.RunWatchdog(ctx, db)
 	gc.RunUsageGC(ctx, db)
+
+	// Worktree GC: prunes per-task worktrees idle longer than
+	// IMPLEMENTER_WORKTREE_TTL_HOURS (default 7d). Wired to a Manager bound
+	// to IMPLEMENTER_DEFAULT_REPO; if the repo is unset, the manager still
+	// scans the base dir but `git worktree remove` no-ops harmlessly.
+	worktreeGCMgr := worktree.New(os.Getenv("IMPLEMENTER_DEFAULT_REPO"), "")
+	worktree.RunGC(ctx, worktreeGCMgr)
 
 	pollTicker := time.NewTicker(cfg.PollInterval)
 	defer pollTicker.Stop()

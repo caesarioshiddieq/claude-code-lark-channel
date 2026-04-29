@@ -95,11 +95,16 @@ func deriveOutcome(r GnhfResult) string {
 // succeeded with commits. Returns the PR URL on success, "" on any failure.
 // gh failures are logged to stderr and never propagated — PR creation is a
 // side-effect of success, not part of the outcome (per Risks Accepted table).
-func tryOpenPR(ctx context.Context, outcome, branchName, prompt string) string {
+//
+// wtPath must point at the worktree where gnhf produced commits. `gh` infers
+// the upstream repo from the cwd; the supervisor's own cwd
+// (/home/caesario per the systemd unit) is never a git repo, so without
+// cmd.Dir every PR-open would fail with "not a git repository".
+func tryOpenPR(ctx context.Context, outcome, branchName, prompt, wtPath string) string {
 	if os.Getenv("IMPLEMENTER_AUTO_PR") != "true" {
 		return ""
 	}
-	if outcome != "success" || branchName == "" {
+	if outcome != "success" || branchName == "" || wtPath == "" {
 		return ""
 	}
 
@@ -107,7 +112,9 @@ func tryOpenPR(ctx context.Context, outcome, branchName, prompt string) string {
 	if len(title) > 60 {
 		title = title[:60]
 	}
-	prTitle := "implement: " + string(title)
+	// Strip embedded newlines so a leading-newline prompt doesn't break the
+	// PR title rendering.
+	prTitle := "implement: " + strings.ReplaceAll(string(title), "\n", " ")
 
 	// #nosec G204 — branchName and prTitle come from internal state, not raw HTTP input.
 	cmd := exec.CommandContext(ctx, "gh", "pr", "create",
@@ -115,6 +122,7 @@ func tryOpenPR(ctx context.Context, outcome, branchName, prompt string) string {
 		"--title", prTitle,
 		"--body", "Autonomous implementation via Lark task comment.",
 	)
+	cmd.Dir = wtPath // gh infers repo from cwd; must be the worktree
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = os.Stderr
@@ -413,7 +421,7 @@ func DispatchImplement(ctx context.Context, row sqlite.InboxRow, deps Deps) erro
 	// Step 7: Auto-PR (env-gated OFF by default for MVP).
 	prURL := ""
 	if result.CommitCount > 0 {
-		prURL = tryOpenPR(ctx, outcome, branchName, row.Content)
+		prURL = tryOpenPR(ctx, outcome, branchName, row.Content, wtPath)
 	}
 	fin.PRURL = prURL
 
