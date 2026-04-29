@@ -303,12 +303,18 @@ func (d *DB) MarkInboxProcessed(ctx context.Context, commentID string) error {
 	return nil
 }
 
-// InsertHumanInbox records a human-originated Lark comment. source='human' is set explicitly.
-func (d *DB) InsertHumanInbox(ctx context.Context, taskID string, c lark.Comment) error {
+// InsertHumanInbox records a human-originated Lark comment with the routing
+// phase determined by the caller (typically intent.Classify on c.Content).
+// source='human' is set explicitly. Empty phase defaults to "normal" so
+// callers that don't classify keep today's behavior.
+func (d *DB) InsertHumanInbox(ctx context.Context, taskID string, c lark.Comment, phase string) error {
+	if phase == "" {
+		phase = "normal"
+	}
 	const q = `INSERT OR IGNORE INTO inbox
 		(comment_id, task_id, content, creator_id, created_at, source, phase)
-		VALUES (?, ?, ?, ?, ?, 'human', 'normal')`
-	_, err := d.db.ExecContext(ctx, q, c.CommentID, taskID, c.Content, c.Creator.ID, c.CreatedAt)
+		VALUES (?, ?, ?, ?, ?, 'human', ?)`
+	_, err := d.db.ExecContext(ctx, q, c.CommentID, taskID, c.Content, c.Creator.ID, c.CreatedAt, phase)
 	if err != nil {
 		return fmt.Errorf("insert human inbox: %w", err)
 	}

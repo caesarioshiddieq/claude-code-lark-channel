@@ -277,7 +277,7 @@ func TestMigration0002_NewColumns(t *testing.T) {
 func TestInsertHumanInbox_SetsSource(t *testing.T) {
 	db := openTestDB(t)
 	c := lark.Comment{CommentID: "C1", Content: "hello", Creator: lark.Creator{ID: "U1"}, CreatedAt: 1}
-	if err := db.InsertHumanInbox(context.Background(), "T1", c); err != nil {
+	if err := db.InsertHumanInbox(context.Background(), "T1", c, "normal"); err != nil {
 		t.Fatalf("InsertHumanInbox: %v", err)
 	}
 	var src, phase string

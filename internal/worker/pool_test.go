@@ -34,7 +34,7 @@ func insertRow(t *testing.T, db *sqlite.DB, commentID, taskID string, ts int64) 
 		CreatedAt: ts,
 		Creator:   lark.Creator{ID: "U1"},
 	}
-	if err := db.InsertHumanInbox(context.Background(), taskID, c); err != nil {
+	if err := db.InsertHumanInbox(context.Background(), taskID, c, "normal"); err != nil {
 		t.Fatalf("insertRow %s: %v", commentID, err)
 	}
 }
