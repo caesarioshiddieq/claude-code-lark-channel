@@ -497,8 +497,11 @@ func TestDispatchImplement_AutoPR_Success(t *testing.T) {
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
+	// tryOpenPR sets cmd.Dir = wtPath; the path must exist or exec.Run fails
+	// before the gh shim can answer.
+	wtPath := t.TempDir()
 	db := newFakeDB()
-	wt := &fakeWorktree{ensurePath: "/wt/task-pr", ensureBranch: "implement/task-pr-aabbccdd"}
+	wt := &fakeWorktree{ensurePath: wtPath, ensureBranch: "implement/task-pr-aabbccdd"}
 	deps := baseDeps(db, wt, func(ctx context.Context, args implementer.GnhfArgs) (implementer.GnhfResult, error) {
 		return implementer.GnhfResult{
 			Status:       implementer.StatusStopped,
@@ -535,8 +538,11 @@ func TestDispatchImplement_AutoPR_GhFails(t *testing.T) {
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
+	// tryOpenPR sets cmd.Dir = wtPath; the path must exist or exec.Run fails
+	// before the gh shim can answer with its non-zero exit.
+	wtPath := t.TempDir()
 	db := newFakeDB()
-	wt := &fakeWorktree{ensurePath: "/wt/task-pr2", ensureBranch: "implement/task-pr2-aabbccdd"}
+	wt := &fakeWorktree{ensurePath: wtPath, ensureBranch: "implement/task-pr2-aabbccdd"}
 	deps := baseDeps(db, wt, func(ctx context.Context, args implementer.GnhfArgs) (implementer.GnhfResult, error) {
 		return implementer.GnhfResult{
 			Status:       implementer.StatusStopped,
