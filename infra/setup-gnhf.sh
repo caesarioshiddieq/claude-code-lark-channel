@@ -19,8 +19,10 @@ set -euo pipefail
 # Pinned gnhf version. Bump deliberately and record the reason in the commit
 # that bumps it; gnhf's outcome enum + log format are observed via this exact
 # version (see internal/implementer/parse.go and the matching plan revision).
-GNHF_VERSION="v0.1.26"
-GNHF_PKG="gnhf@${GNHF_VERSION#v}"  # npm wants no leading "v"
+# NOTE: stored without leading "v" to match `gnhf --version` output exactly
+# (verified empirically on v0.1.26 — output is "0.1.26\n", no banner).
+GNHF_VERSION="0.1.26"
+GNHF_PKG="gnhf@${GNHF_VERSION}"
 
 DRY_RUN=0
 for arg in "$@"; do
@@ -56,10 +58,11 @@ if [ "$NODE_MAJOR" -lt 20 ]; then
 fi
 log "node v$(node -p 'process.versions.node') ok (>=20 required)"
 
-# Detect installed version (if any). gnhf --version emits "gnhf v0.1.26" on stdout.
+# Detect installed version (if any). gnhf --version emits the bare semver on
+# stdout, e.g. "0.1.26\n" — no banner, no "v" prefix.
 INSTALLED_VERSION=""
 if command -v gnhf >/dev/null 2>&1; then
-  INSTALLED_VERSION="$(gnhf --version 2>/dev/null | awk '{print $NF}' || true)"
+  INSTALLED_VERSION="$(gnhf --version 2>/dev/null | tr -d '[:space:]' || true)"
 fi
 
 if [ "$INSTALLED_VERSION" = "$GNHF_VERSION" ]; then
@@ -90,12 +93,16 @@ else
   sudo npm install -g "$GNHF_PKG"
 fi
 
-# Verify post-install.
+# Verify post-install. The npm prefix's bin/ directory must be on PATH for
+# this lookup to succeed. On the VM this is /usr/local/bin (default); on dev
+# machines that override the prefix (e.g. ~/.npm-global), the operator must
+# add $(npm config get prefix)/bin to PATH or set NPM_CONFIG_PREFIX globally.
 if ! command -v gnhf >/dev/null 2>&1; then
-  echo "setup-gnhf.sh: gnhf still not on PATH after install" >&2
+  echo "setup-gnhf.sh: gnhf installed at $NPM_LIB/gnhf but not on PATH" >&2
+  echo "                add '$(npm config get prefix)/bin' to your PATH" >&2
   exit 1
 fi
-POST_VERSION="$(gnhf --version 2>/dev/null | awk '{print $NF}' || true)"
+POST_VERSION="$(gnhf --version 2>/dev/null | tr -d '[:space:]' || true)"
 if [ "$POST_VERSION" != "$GNHF_VERSION" ]; then
   echo "setup-gnhf.sh: post-install version mismatch: got '$POST_VERSION', want '$GNHF_VERSION'" >&2
   exit 1
